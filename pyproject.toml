@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=67"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "surf-track"
+version = "0.2.0"
+description = "Open-source surfer detection dataset and training control plane"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    "gdown>=6.1,<7",
+]
+
+[project.optional-dependencies]
+train = ["pillow>=10,<13", "torch>=2.4,<3", "torchvision>=0.19,<1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

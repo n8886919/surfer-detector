@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f5f5f5">
+    <title>SurfTrack</title>
+    <link rel="stylesheet" href="/assets/styles.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="app-header">
+      <strong>SurfTrack</strong>
+      <nav aria-label="主要功能">
+        <button class="nav-item active" type="button" data-page="dataset">Data</button>
+        <button class="nav-item" type="button" data-page="label">Label</button>
+        <button class="nav-item" type="button" data-page="train">Train</button>
+      </nav>
+      <code id="app-version">v0.2.0</code>
+    </header>
+
+    <main>
+      <section class="page active" id="dataset-page" data-page-panel="dataset">
+        <div class="page-head">
+          <h1>Dataset</h1>
+          <p>輸入來源，確認影片，建立 Dataset。</p>
+        </div>
+
+        <section class="panel">
+          <h2>1. 影片來源</h2>
+          <form id="drive-form" novalidate>
+            <label for="drive-url">公開 Google Drive 或 Facebook 連結</label>
+            <div class="input-row">
+              <input id="drive-url" name="url" type="url" autocomplete="off" placeholder="https://..." required>
+              <button class="secondary-button" id="clear-url" type="button">清除</button>
+              <button class="primary-button" id="scan-button" type="submit"><span>掃描影片</span></button>
+            </div>
+          </form>
+          <p class="hint" id="source-note"><span id="source-note-text">Drive 必須設為知道連結的任何人都能下載。</span></p>
+          <div class="notice" id="facebook-guard" hidden>
+            不要貼 Facebook 密碼、cookie 或 token。程式只保存清除追蹤參數後的網址。
+          </div>
+          <div class="scan-status" id="scan-status" data-state="idle" aria-live="polite">
+            <span class="status-icon">·</span>
+            <div><strong id="status-title">等待來源連結</strong><p id="status-message">尚未掃描。</p></div>
+          </div>
+        </section>
+
+        <section class="panel hidden" id="results-panel">
+          <div class="section-head">
+            <h2>掃描結果</h2>
+            <span><b id="video-count">0</b> 支影片 · <b id="total-size">—</b></span>
+          </div>
+          <p id="source-name">—</p>
+
+          <section class="next-step" id="next-step-panel" hidden tabindex="-1">
+            <h3>下一步：填分享者，建立 Dataset</h3>
+            <p id="next-step-summary">來源已掃描。</p>
+            <div class="form-grid">
+              <div>
+                <label for="dataset-name">Dataset 名稱</label>
+                <input id="dataset-name" type="text" maxlength="120" autocomplete="off">
+              </div>
+              <div>
+                <label for="sharer-name">分享者／來源名稱 <span class="required">必填</span></label>
+                <input id="sharer-name" type="text" maxlength="120" autocomplete="off" placeholder="例：王小明、XX 衝浪社團">
+              </div>
+            </div>
+            <p class="hint">Dataset 會保存分享者、來源平台、正規化網址及影片數。切分固定為 train 80% / valid 10% / test 10%，seed 42。</p>
+            <button class="primary-button" id="create-dataset-button" type="button" disabled>建立 Dataset</button>
+            <span class="inline-status" id="dataset-create-status">請先填分享者。</span>
+          </section>
+
+          <details class="video-details">
+            <summary>檢視影片清單</summary>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>影片</th><th>解析度</th><th>長度</th><th>容量</th></tr></thead>
+                <tbody id="video-table"></tbody>
+              </table>
+            </div>
+          </details>
+        </section>
+
+        <section class="panel">
+          <div class="section-head">
+            <h2>2. 私人 Google Drive</h2>
+            <span class="state-badge" id="private-drive-state">未連接</span>
+          </div>
+          <p class="hint">OAuth token 不輸入網頁；由本機 OAuth 寫入權限受限的秘密檔案。</p>
+          <button class="secondary-button" id="connect-drive-button" type="button">連接狀態</button>
+          <div class="notice" id="drive-setup-note" hidden>
+            目前尚未安裝並設定 rclone，因此不能開始下載、抽圖或上傳。Dataset 可以先建立，來源資訊不會遺失。
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>3. 開始處理</h2>
+          <div class="ingest-controls">
+            <div>
+              <label for="ingest-dataset-select">Dataset</label>
+              <select id="ingest-dataset-select" disabled><option value="">尚未建立 Dataset</option></select>
+            </div>
+            <button class="primary-button" id="start-ingest-button" type="button" disabled>開始處理</button>
+          </div>
+          <p class="hint" id="ingest-help">每支影片每秒抽 1 張；按來源影片切分 80/10/10。下載、抽圖及上傳皆可從已完成影片繼續。</p>
+        </section>
+
+        <section class="panel">
+          <h2>處理進度</h2>
+          <div class="jobs-list" id="jobs-list">
+            <div class="empty-row"><strong>目前沒有處理工作</strong><small>建立處理工作後，這裡會顯示下載、抽圖與上傳進度。</small></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="label-page" data-page-panel="label" hidden>
+        <div class="page-head section-head">
+          <div><h1>Label</h1><p>拉框後用 W/E/R 切換狀態。</p></div>
+          <span><b id="label-progress-count">0 / 0</b> 已標圖片 · <span class="autosave-state" id="autosave-state">已保存</span></span>
+        </div>
+
+        <section class="panel label-controls">
+          <div>
+            <label for="label-dataset-select">Dataset</label>
+            <select id="label-dataset-select" disabled><option value="">尚未建立 Dataset</option></select>
+          </div>
+          <span id="label-image-position">— / —</span>
+          <button class="secondary-button" id="crop-region-button" type="button" disabled>區域</button>
+          <button class="secondary-button" id="clear-region-button" type="button" disabled>全圖</button>
+          <button class="secondary-button" id="previous-image-button" type="button" disabled>上一張</button>
+          <button class="secondary-button" id="random-image-button" type="button" disabled>隨機下一張</button>
+        </section>
+
+        <section class="label-layout">
+          <aside class="panel shortcut-panel">
+            <h2>狀態</h2>
+            <div class="shortcut-list">
+              <button type="button" data-action="chasing_wave"><kbd>W</kbd><span>追浪</span></button>
+              <button type="button" data-action="takeoff"><kbd>E</kbd><span>起乘</span></button>
+              <button type="button" data-action="surfing"><kbd>R</kbd><span>衝浪</span></button>
+            </div>
+            <p class="hint">區域：拖出要標注的範圍<br>拖曳：新增框<br>點框：選取<br>拖框邊緣：調整大小<br>滾輪：以游標縮放<br>Space：保存並下一張<br>Delete：刪除框</p>
+          </aside>
+
+          <div class="label-stage panel" id="label-stage" tabindex="0">
+            <div class="label-empty" id="label-empty"><strong>沒有可標注圖片</strong><p>先完成 Data 的抽圖。</p></div>
+            <div class="image-frame" id="image-frame" hidden>
+              <img id="label-image" alt="待標注影格" draggable="false">
+              <div class="annotation-layer" id="annotation-layer"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel label-footer">
+          <span class="hint">已保存的標注圖片會直接用於 detector；設定區域時，範圍外不納入訓練。</span>
+          <span id="selected-box-status">尚未選取人物框</span>
+        </section>
+      </section>
+
+      <section class="page" id="train-page" data-page-panel="train" hidden>
+        <div class="page-head"><h1>Train</h1><p>Surfer detector + 三項獨立動作分類。</p></div>
+        <section class="panel train-controls">
+          <div>
+            <label for="dataset-select">Dataset</label>
+            <select id="dataset-select" disabled><option value="">尚未建立 Dataset</option></select>
+          </div>
+          <button class="primary-button" id="start-train-button" type="button">Train 小模型</button>
+          <span class="hint">目標：Jetson Orin Nano 8GB · 單路 · 10 Hz</span>
+          <span class="hint" id="train-status">已保存的標注圖片會用於 detector 與動作分類。</span>
+        </section>
+        <section class="panel training-overview">
+          <div class="section-head"><h2>最新結果</h2><span id="latest-run-state">尚未訓練</span></div>
+          <div class="metric-grid">
+            <article><span>Detector recall</span><b id="metric-recall">—</b></article>
+            <article><span>Detector mAP50</span><b id="metric-map50">—</b></article>
+            <article><span>Action macro F1</span><b id="metric-action-f1">—</b></article>
+            <article><span>Orin speed</span><b id="metric-hz">—</b></article>
+          </div>
+          <div class="action-metrics">
+            <div><span>追浪</span><progress value="0" max="1"></progress><b id="metric-chasing">—</b></div>
+            <div><span>起乘</span><progress value="0" max="1"></progress><b id="metric-takeoff">—</b></div>
+            <div><span>衝浪</span><progress value="0" max="1"></progress><b id="metric-surfing">—</b></div>
+          </div>
+        </section>
+        <section class="panel training-preview">
+          <div class="section-head"><h2>辨識結果 5 × 5</h2><span id="preview-status">等待模型</span></div>
+          <p class="hint" id="preview-note">優先抽 valid / test 圖片。</p>
+          <div class="prediction-grid" id="prediction-grid"></div>
+        </section>
+      </section>
+    </main>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
