@@ -5,7 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from surf_track.training.stream import StreamError, validate_host
+from surf_track.training.stream import (
+    DETECTOR_EPOCHS, DETECTOR_MIN_TRAIN_IMAGES, DETECTOR_MIN_VALID_IMAGES,
+    StreamError, validate_host,
+)
 
 
 def _jpeg(width: int, height: int) -> bytes:
@@ -267,3 +270,61 @@ def test_backbone_freezing_is_bounded_and_actually_freezes() -> None:
     assert trainable_fraction(1) < trainable_fraction(2) < trainable_fraction(5)
     with pytest.raises(ValueError):
         build_detector(trainable_stages=9, weights_backbone=None)
+
+
+def _annotated_store(tmp_path: Path, detector_frames: dict[str, int]):
+    """A store whose frames are detector-ready in the split counts asked for."""
+    from surf_track.store import SurfTrackStore
+
+    store = SurfTrackStore(tmp_path / "var")
+    dataset = store.create_dataset(
+        "pilot",
+        source_provider="google_drive",
+        source_url="https://drive.google.com/drive/folders/1AbCdEfGhijKLMnOP",
+        source_title="Shared surf clips",
+        sharer_name="測試分享者",
+        source_video_count=4,
+    )
+    boxes = [{"x": 0.1, "y": 0.2, "width": 0.05, "height": 0.08, "surfing": True}]
+    for split, count in detector_frames.items():
+        for index in range(count):
+            path = store.media_dir / f"{split}-{index}.jpg"
+            path.write_bytes(b"jpeg")
+            image = store.add_image(
+                dataset["id"], path, source_group=f"v{index}", split=split,
+                width=1920, height=1080,
+            )
+            store.save_annotations(image["id"], boxes, complete_for_detection=True)
+    return store
+
+
+@pytest.mark.parametrize("frames, detector_runs", [
+    # One valid frame short, so the detector phase must not be planned at all.
+    ({"train": DETECTOR_MIN_TRAIN_IMAGES, "valid": DETECTOR_MIN_VALID_IMAGES - 1}, False),
+    ({"train": DETECTOR_MIN_TRAIN_IMAGES - 1, "valid": DETECTOR_MIN_VALID_IMAGES}, False),
+    ({"train": DETECTOR_MIN_TRAIN_IMAGES, "valid": DETECTOR_MIN_VALID_IMAGES}, True),
+])
+def test_detector_phase_is_planned_only_when_enough_frames_are_labelled(
+    tmp_path: Path, frames: dict[str, int], detector_runs: bool, monkeypatch,
+) -> None:
+    """total_epochs drives the Train page progress bar, so it must count both phases."""
+    from surf_track.training.manager import TrainingManager
+
+    store = _annotated_store(tmp_path, frames)
+    manager = TrainingManager(store)
+    captured: dict[str, object] = {}
+    # The real _run would ssh to the GPU box; only the plan it is handed is under test.
+    monkeypatch.setattr(
+        TrainingManager, "_run",
+        lambda self, run_id, epochs, samples, host, images, detector_epochs: captured.update(
+            detector_epochs=detector_epochs,
+        ),
+    )
+
+    run = manager.start(["測試分享者"], host="nolan@10.0.0.1", epochs=24)
+    # start() only launches the thread; the stub records what it was handed.
+    manager._threads[str(run["id"])].join(timeout=10)
+
+    expected = DETECTOR_EPOCHS if detector_runs else 0
+    assert captured["detector_epochs"] == expected
+    assert run["total_epochs"] == 24 + expected

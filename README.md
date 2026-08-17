@@ -34,8 +34,9 @@ python3 -m venv .venv
 python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@192.168.x.x
 ```
 
-Detector 目前只有 CLI（UI 還沒接）。它吃的是「整張標完」的影格，pixels 會先降到 896×512
-存進 `var/cache/frames/`，模型寫到 `var/models/detector/`：
+Detector 吃的是「整張標完」的影格，pixels 會先降到 896×512 存進 `var/cache/frames/`，
+模型寫到 `var/models/detector/`。Train 會在動作模型跑完後接著訓練它（整張標完的影格
+不足 12 train / 3 valid 時自動跳過），也可以單獨從 CLI 跑：
 
 ```bash
 python -m surf_track.training.stream feed-detector --host user@192.168.x.x

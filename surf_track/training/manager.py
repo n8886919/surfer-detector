@@ -96,7 +96,10 @@ class TrainingManager:
         return str(destination)
 
     def start(self, sharers: list[str], *, host: str, epochs: int = 24) -> dict[str, object]:
-        from surf_track.training.stream import StreamError, validate_host
+        from surf_track.training.stream import (
+            DETECTOR_EPOCHS, DETECTOR_MIN_TRAIN_IMAGES, DETECTOR_MIN_VALID_IMAGES,
+            StreamError, validate_host,
+        )
 
         if not sharers:
             raise TrainingError("請至少勾選一位分享者的資料集。")
@@ -109,14 +112,22 @@ class TrainingManager:
         samples = self.store.list_action_samples(sharers)
         if not samples:
             raise TrainingError("勾選的分享者還沒有任何已標注的人物框。")
+        # The detector needs whole frames where every surfer is boxed, which lag the action
+        # boxes; too few and the run trains the action model alone rather than failing.
+        detector_images = self.store.list_detector_images(sharers)
+        splits = [image["split"] for image in detector_images]
+        detector_epochs = DETECTOR_EPOCHS if (
+            splits.count("train") >= DETECTOR_MIN_TRAIN_IMAGES
+            and splits.count("valid") >= DETECTOR_MIN_VALID_IMAGES
+        ) else 0
         try:
-            run = self.store.create_training_run(sharers, total_epochs=epochs)
+            run = self.store.create_training_run(sharers, total_epochs=epochs + detector_epochs)
         except StoreError as exc:
             raise TrainingError(str(exc)) from exc
         run_id = str(run["id"])
         thread = threading.Thread(
             target=self._run,
-            args=(run_id, epochs, samples, target),
+            args=(run_id, epochs, samples, target, detector_images, detector_epochs),
             name=f"surftrack-train-{run_id}",
             daemon=True,
         )
@@ -131,12 +142,14 @@ class TrainingManager:
         epochs: int,
         samples: list[dict[str, object]],
         host: str,
+        detector_images: list[dict[str, object]],
+        detector_epochs: int,
     ) -> None:
         metrics: dict[str, object] = {"stage": f"連線遠端 GPU 主機 {host}"}
         self.store.update_training_run(run_id, state="running", epoch=0, metrics=metrics)
         try:
             # Training only ever runs on the remote GPU host; frames stay on this machine.
-            from surf_track.training.stream import feed
+            from surf_track.training.stream import feed, feed_detector
 
             output_path = self.store.data_dir / ACTION_MODEL_PATH
 
@@ -152,8 +165,48 @@ class TrainingManager:
                 cache_dir=self.store.data_dir / "cache" / "crops",
             )
             final_metrics["model_path"] = str(output_path.relative_to(self.store.data_dir))
-            final_metrics["detector_state"] = "waiting_for_complete_images"
-            self.store.update_training_run(run_id, state="completed", epoch=epochs, metrics=final_metrics)
+
+            if not detector_epochs:
+                final_metrics["detector_state"] = "waiting_for_complete_images"
+            else:
+                # Sequentially, on the same run row and the same 6GB card: the progress bar
+                # counts action epochs first, then detector epochs.
+                detector_path = self.store.data_dir / DETECTOR_MODEL_PATH
+
+                def on_detector_epoch(epoch: int, current: dict[str, float]) -> None:
+                    self.store.update_training_run(
+                        run_id, state="running", epoch=epochs + epoch,
+                        metrics={**final_metrics, **current},
+                    )
+
+                try:
+                    detector_metrics = feed_detector(
+                        detector_images,
+                        detector_path,
+                        host=host,
+                        epochs=detector_epochs,
+                        on_epoch=on_detector_epoch,
+                        cache_dir=self.store.data_dir / "cache" / "frames",
+                    )
+                except Exception as exc:
+                    # The action model is already trained and written; failing the whole run
+                    # here would throw its metrics away and show the Train page nothing.
+                    final_metrics["detector_state"] = "failed"
+                    final_metrics["error"] = f"動作模型已完成，但 detector 訓練失敗：{exc}"
+                else:
+                    # Only the detector_* keys: the rest (remote_gpu, streamed_mb,
+                    # frames_built) would otherwise overwrite what the action run reported.
+                    final_metrics.update({
+                        name: value for name, value in detector_metrics.items()
+                        if name.startswith("detector_")
+                    })
+                    final_metrics["detector_state"] = "trained"
+                    final_metrics["detector_model_path"] = str(
+                        detector_path.relative_to(self.store.data_dir)
+                    )
+            self.store.update_training_run(
+                run_id, state="completed", epoch=epochs + detector_epochs, metrics=final_metrics,
+            )
         except Exception as exc:
             metrics["error"] = str(exc)
             self.store.update_training_run(run_id, state="failed", epoch=0, metrics=metrics)

@@ -47,6 +47,10 @@ DETECTOR_WARMUP_STEPS = 250
 # The confidence the deployed pipeline would run at: recall and FP/frame are reported there,
 # while mAP50 stays threshold-free and picks the checkpoint.
 DETECTOR_SCORE_THRESHOLD = 0.5
+# Enough frames to be a dataset rather than a demo. The manager checks this before it opens a
+# run row, so a half-labelled workspace trains the action model alone instead of failing late.
+DETECTOR_MIN_TRAIN_IMAGES = 12
+DETECTOR_MIN_VALID_IMAGES = 3
 _FRAME = struct.Struct(">II")
 # The host is passed straight to ssh, which has no "--" terminator: a value starting with
 # "-" would be read as an option (e.g. -oProxyCommand=...) and run commands locally.
@@ -419,8 +423,12 @@ def feed_detector(
 
     grouped = {split: [i for i in images if i["split"] == split] for split in ("train", "valid", "test")}
     # Frames, not boxes: batches are frames, and a 12-box single frame is not a dataset.
-    if len(grouped["train"]) < 12 or len(grouped["valid"]) < 3:
-        raise StreamError("至少需要 12 張 train 影格和 3 張 valid 影格才能開始 detector 訓練。")
+    if (len(grouped["train"]) < DETECTOR_MIN_TRAIN_IMAGES
+            or len(grouped["valid"]) < DETECTOR_MIN_VALID_IMAGES):
+        raise StreamError(
+            f"至少需要 {DETECTOR_MIN_TRAIN_IMAGES} 張 train 影格和 "
+            f"{DETECTOR_MIN_VALID_IMAGES} 張 valid 影格才能開始 detector 訓練。"
+        )
 
     cache = FrameCache(cache_dir, INPUT_WIDTH, INPUT_HEIGHT)
     link = _start_worker(target, remote_root, prefetch, ack_timeout, on_epoch)
