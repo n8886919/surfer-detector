@@ -389,7 +389,9 @@ class SurfTrackStore:
                   JOIN datasets d ON d.id = i.dataset_id
                   JOIN annotations a ON a.image_id = i.id
                 {clause}
-              ORDER BY i.created_at, a.id
+              -- See list_detector_images: ordering by the random uuid alone would make the
+              -- seeded shuffle non-reproducible across runs.
+              ORDER BY i.created_at, i.id, a.y, a.x, a.id
                 """,
                 parameters,
             ).fetchall()
@@ -401,6 +403,66 @@ class SurfTrackStore:
             }
             for row in rows
         ]
+
+    def list_detector_images(self, sharers: list[str] | None = None) -> list[dict[str, object]]:
+        """One entry per detector-ready image, with its boxes nested.
+
+        Nested rather than one row per box because the feeder batches whatever this returns:
+        a flat list would split one image's boxes across batches and send the frame twice.
+        Images carrying a crop_region are skipped — everything outside it is unverified, so
+        it cannot be used as background.
+        """
+        if isinstance(sharers, str):
+            raise TypeError("sharers must be a list of sharer names, not a single string")
+        clause = ""
+        parameters: tuple[object, ...] = ()
+        if sharers is not None:
+            if not sharers:
+                return []
+            placeholders = ",".join("?" for _ in sharers)
+            clause = f" AND d.sharer_name IN ({placeholders})"
+            parameters = tuple(sharers)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                -- Both tables have width/height, so every one is aliased: an unaliased
+                -- a.width silently resolves to i.width in sqlite3.Row.
+                SELECT i.id AS image_id, i.local_path, i.split,
+                       i.width AS image_width, i.height AS image_height,
+                       a.x AS box_x, a.y AS box_y,
+                       a.width AS box_width, a.height AS box_height
+                  FROM images i
+                  JOIN datasets d ON d.id = i.dataset_id
+                  JOIN annotations a ON a.image_id = i.id
+                 WHERE i.complete_for_detection = 1 AND i.crop_x IS NULL
+                {clause}
+              -- Geometry before id: annotation ids are random uuids, so ordering by id
+              -- alone makes the sample order differ every run and silently breaks the
+              -- reproducibility that the seeded shuffle is supposed to give.
+              ORDER BY i.created_at, i.id, a.y, a.x, a.id
+                """,
+                parameters,
+            ).fetchall()
+
+        images: dict[str, dict[str, object]] = {}
+        for row in rows:
+            image_id = str(row["image_id"])
+            entry = images.get(image_id)
+            if entry is None:
+                entry = images[image_id] = {
+                    "image_id": image_id,
+                    "path": self.media_dir / str(row["local_path"]),
+                    "split": row["split"],
+                    "width": row["image_width"],
+                    "height": row["image_height"],
+                    "boxes": [],
+                }
+            # Normalised xywh, as stored; the feeder scales them to the cached frame.
+            entry["boxes"].append([
+                float(row["box_x"]), float(row["box_y"]),
+                float(row["box_width"]), float(row["box_height"]),
+            ])
+        return list(images.values())
 
     def mark_annotated_images_detection_ready(self, dataset_id: str) -> int:
         self.get_dataset(dataset_id)

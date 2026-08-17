@@ -193,3 +193,45 @@ def test_existing_annotated_images_can_be_marked_detection_ready(tmp_path: Path)
 
     assert store.mark_annotated_images_detection_ready(str(dataset["id"])) == 1
     assert store.get_annotations(str(image["id"]))["complete_for_detection"] is True
+
+
+def test_detector_images_nest_boxes_and_report_box_not_image_size(tmp_path: Path) -> None:
+    """Both tables have width/height columns; an unaliased a.width silently reads i.width."""
+    store = SurfTrackStore(tmp_path / "var")
+    dataset = create_test_dataset(store)
+    path = store.media_dir / "frame.jpg"
+    path.write_bytes(b"jpeg")
+    image = store.add_image(
+        dataset["id"], path, source_group="video-1", split="train", width=1920, height=1080
+    )
+    store.save_annotations(
+        image["id"],
+        [
+            {"x": 0.10, "y": 0.20, "width": 0.05, "height": 0.08, "surfing": True},
+            {"x": 0.60, "y": 0.30, "width": 0.04, "height": 0.06, "chasing_wave": True},
+        ],
+        complete_for_detection=True,
+    )
+
+    images = store.list_detector_images()
+    assert len(images) == 1, "two boxes on one frame must stay nested under one entry"
+    entry = images[0]
+    assert entry["width"] == 1920 and entry["height"] == 1080
+    assert entry["path"] == path
+    # The box dimensions must be the annotation's, not the frame's.
+    assert entry["boxes"] == [[0.10, 0.20, 0.05, 0.08], [0.60, 0.30, 0.04, 0.06]]
+    assert all(0 < box[2] <= 1 and 0 < box[3] <= 1 for box in entry["boxes"])
+
+
+def test_detector_images_skip_partially_verified_frames(tmp_path: Path) -> None:
+    store = SurfTrackStore(tmp_path / "var")
+    dataset = create_test_dataset(store)
+    boxes = [{"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "surfing": True}]
+    for index, crop in enumerate((None, {"x": 0.0, "y": 0.0, "width": 0.9, "height": 0.9})):
+        path = store.media_dir / f"frame-{index}.jpg"
+        path.write_bytes(b"jpeg")
+        image = store.add_image(dataset["id"], path, source_group=f"v{index}", split="train")
+        store.save_annotations(image["id"], boxes, complete_for_detection=True, crop_region=crop)
+
+    # Outside a crop_region nothing is verified, so that frame cannot serve as background.
+    assert len(store.list_detector_images()) == 1
