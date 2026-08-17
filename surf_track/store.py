@@ -98,7 +98,6 @@ class SurfTrackStore:
                     width REAL NOT NULL,
                     height REAL NOT NULL,
                     chasing_wave INTEGER NOT NULL DEFAULT 0,
-                    paddling INTEGER NOT NULL DEFAULT 0,
                     takeoff INTEGER NOT NULL DEFAULT 0,
                     surfing INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
@@ -139,6 +138,7 @@ class SurfTrackStore:
             self._migrate_image_crop_fields(connection)
             self._migrate_job_dataset_field(connection)
             self._migrate_training_runs_to_sharer_scope(connection)
+            self._migrate_drop_paddling(connection)
 
     @staticmethod
     def _migrate_dataset_source_fields(connection: sqlite3.Connection) -> None:
@@ -185,6 +185,16 @@ class SurfTrackStore:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS jobs_dataset_idx ON jobs(dataset_id, updated_at DESC)"
         )
+
+    @staticmethod
+    def _migrate_drop_paddling(connection: sqlite3.Connection) -> None:
+        """`paddling` was dropped from the label set; the column never held a positive."""
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(annotations)").fetchall()
+        }
+        if "paddling" in columns:
+            connection.execute("ALTER TABLE annotations DROP COLUMN paddling")
 
     @staticmethod
     def _migrate_training_runs_to_sharer_scope(connection: sqlite3.Connection) -> None:
