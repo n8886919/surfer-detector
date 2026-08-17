@@ -8,7 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from surf_track import __version__
 from surf_track.config import Settings
@@ -47,7 +47,10 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/v1/training-preview":
             try:
-                result = self.server.training_manager.preview()  # type: ignore[attr-defined]
+                seed = parse_qs(urlparse(self.path).query).get("seed", ["42"])[0]
+                result = self.server.training_manager.preview(  # type: ignore[attr-defined]
+                    seed=int(seed) if seed.isdigit() else 42
+                )
                 self._send_json(result)
             except (TrainingError, StoreError) as exc:
                 self._send_json(

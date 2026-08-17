@@ -143,12 +143,16 @@ kbd { display: inline-grid; min-width: 24px; min-height: 24px; place-items: cent
 .action-metrics { margin-top: 12px; }
 .action-metrics > div { display: grid; grid-template-columns: 60px 1fr 50px; align-items: center; gap: 12px; padding: 7px 0; }
 progress { width: 100%; }
-.prediction-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.prediction-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
+.preview-head-actions { display: flex; align-items: center; gap: 10px; }
 .prediction-card { min-width: 0; margin: 0; }
-.prediction-image { position: relative; overflow: hidden; border: 1px solid var(--line); background: #222; line-height: 0; }
+/* Room above the image so a label sitting on top of a box near the edge is not clipped. */
+.prediction-image { position: relative; overflow: visible; margin-top: 14px; border: 1px solid var(--line); background: #222; line-height: 0; }
 .prediction-image img { display: block; width: 100%; height: auto; }
-.prediction-box { position: absolute; border: 1px solid #00d4ff; }
-.prediction-box span { position: absolute; top: 0; left: 0; max-width: 180px; padding: 2px 3px; color: #000; background: #00d4ff; font: 9px/1.2 ui-monospace, monospace; white-space: nowrap; }
+/* Border colour carries the three probabilities as RGB intensity, so a low-confidence box
+   is genuinely dark; the pale halo keeps it visible against both water and foam. */
+.prediction-box { position: absolute; border: 2px solid; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.45); }
+.prediction-box span { position: absolute; bottom: 100%; left: -2px; margin-bottom: 2px; padding: 1px 3px; font: 9px/1.2 ui-monospace, monospace; white-space: nowrap; }
 .prediction-card figcaption { display: flex; justify-content: space-between; color: var(--muted); font: 10px/1.4 ui-monospace, monospace; }
 .autosave-state.saving { color: var(--warning); }
 .autosave-state.error { color: var(--error); }

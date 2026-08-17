@@ -20,7 +20,8 @@ class TrainingManager:
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
 
-    def preview(self, *, limit: int = 25) -> dict[str, object]:
+    def preview(self, *, limit: int = 16, seed: int = 42) -> dict[str, object]:
+        """`seed` picks which sample of images to draw, so the UI can ask for another batch."""
         samples = self.store.list_action_samples()
         model_path = self.store.data_dir / ACTION_MODEL_PATH
         if not model_path.is_file():
@@ -37,7 +38,7 @@ class TrainingManager:
             image_id for image_id, boxes in grouped.items()
             if boxes[0]["split"] == "train"
         ]
-        selector = random.Random(42)
+        selector = random.Random(seed)
         selector.shuffle(evaluation_ids)
         selector.shuffle(train_ids)
         selected_ids = (evaluation_ids + train_ids)[:limit]

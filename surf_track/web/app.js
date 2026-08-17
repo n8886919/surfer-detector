@@ -86,6 +86,7 @@ const state = {
   zoomX: 0,
   zoomY: 0,
   previewKey: null,
+  previewSeed: 42,
   previewLoading: false,
 };
 
@@ -131,6 +132,7 @@ const elements = {
   previewStatus: document.querySelector("#preview-status"),
   previewNote: document.querySelector("#preview-note"),
   predictionGrid: document.querySelector("#prediction-grid"),
+  refreshPreviewButton: document.querySelector("#refresh-preview-button"),
   labelProgressCount: document.querySelector("#label-progress-count"),
   autosaveState: document.querySelector("#autosave-state"),
   labelImagePosition: document.querySelector("#label-image-position"),
@@ -651,10 +653,22 @@ function renderTrainingPreview(payload) {
       element.style.top = `${Number(box.y) * 100}%`;
       element.style.width = `${Number(box.width) * 100}%`;
       element.style.height = `${Number(box.height) * 100}%`;
-      const label = document.createElement("span");
-      const probability = box.probabilities;
-      label.textContent = `追${Math.round(probability.chasing_wave * 100)} 起${Math.round(probability.takeoff * 100)} 衝${Math.round(probability.surfing * 100)}`;
-      element.appendChild(label);
+      // R/G/B intensity = chasing_wave / takeoff / surfing probability.
+      const channels = [
+        ["追浪", Number(box.probabilities.chasing_wave) || 0],
+        ["起乘", Number(box.probabilities.takeoff) || 0],
+        ["衝浪", Number(box.probabilities.surfing) || 0],
+      ];
+      const [red, green, blue] = channels.map(([, value]) => Math.round(value * 255));
+      element.style.borderColor = `rgb(${red}, ${green}, ${blue})`;
+      const [topName, topValue] = channels.reduce((best, item) => (item[1] > best[1] ? item : best));
+      if (topValue > 0.9) {
+        const label = document.createElement("span");
+        label.textContent = `${topName} ${Math.round(topValue * 100)}`;
+        label.style.background = `rgb(${red}, ${green}, ${blue})`;
+        label.style.color = 0.299 * red + 0.587 * green + 0.114 * blue > 140 ? "#000" : "#fff";
+        element.appendChild(label);
+      }
       imageWrap.appendChild(element);
     }
     const caption = document.createElement("figcaption");
@@ -668,12 +682,13 @@ function renderTrainingPreview(payload) {
 async function loadTrainingPreview() {
   const run = state.workspace.training_runs.find((item) => item.state === "completed");
   if (!run || state.previewLoading) return;
-  const key = run.id;
+  const key = `${run.id}:${state.previewSeed}`;
   if (state.previewKey === key) return;
   state.previewLoading = true;
+  elements.refreshPreviewButton.disabled = true;
   elements.previewStatus.textContent = "辨識中…";
   try {
-    const response = await fetch("/api/v1/training-preview");
+    const response = await fetch(`/api/v1/training-preview?seed=${state.previewSeed}`);
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || "無法產生辨識預覽。");
     renderTrainingPreview(payload);
@@ -683,6 +698,7 @@ async function loadTrainingPreview() {
     elements.previewNote.textContent = error.message;
   } finally {
     state.previewLoading = false;
+    elements.refreshPreviewButton.disabled = false;
   }
 }
 
@@ -1281,6 +1297,10 @@ elements.connectDriveButton.addEventListener("click", () => {
 elements.ingestDatasetSelect.addEventListener("change", updateIngestButton);
 elements.startIngestButton.addEventListener("click", startIngest);
 elements.trainHost.addEventListener("input", renderLatestTrainingRun);
+elements.refreshPreviewButton.addEventListener("click", () => {
+  state.previewSeed = Math.floor(Math.random() * 1000000);
+  loadTrainingPreview();
+});
 elements.startTrainButton.addEventListener("click", startTraining);
 elements.labelDatasetSelect.addEventListener("change", (event) => {
   state.loadedLabelDatasetId = null;
