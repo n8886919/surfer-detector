@@ -661,10 +661,10 @@ function renderTrainingPreview(payload) {
       ];
       const [red, green, blue] = channels.map(([, value]) => Math.round(value * 255));
       element.style.borderColor = `rgb(${red}, ${green}, ${blue})`;
-      const [topName, topValue] = channels.reduce((best, item) => (item[1] > best[1] ? item : best));
+      const topValue = Math.max(...channels.map(([, value]) => value));
       if (topValue > 0.9) {
         const label = document.createElement("span");
-        label.textContent = `${topName} ${Math.round(topValue * 100)}`;
+        label.textContent = channels.map(([, value]) => Math.round(value * 100)).join("/");
         label.style.background = `rgb(${red}, ${green}, ${blue})`;
         label.style.color = 0.299 * red + 0.587 * green + 0.114 * blue > 140 ? "#000" : "#fff";
         element.appendChild(label);
