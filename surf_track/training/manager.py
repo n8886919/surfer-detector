@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from surf_track.store import StoreError, SurfTrackStore
@@ -9,6 +10,12 @@ from surf_track.store import StoreError, SurfTrackStore
 # One combined model trained across the selected sharers, not one model per dataset.
 ACTION_MODEL_PATH = Path("models") / "action" / "actions_mobilenet_v3_small.pt"
 DETECTOR_MODEL_PATH = Path("models") / "detector" / "surfer_fcos_mobilenet_v3_large.pt"
+
+
+def _trained_at(model_path: Path) -> str:
+    """When the checkpoint landed. The preview says which model it is showing, because a
+    stale model that still predicts plausibly is otherwise indistinguishable from a fresh one."""
+    return datetime.fromtimestamp(model_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
 
 
 class TrainingError(RuntimeError):
@@ -43,37 +50,63 @@ class TrainingManager:
         selector.shuffle(evaluation_ids)
         selector.shuffle(train_ids)
         selected_ids = (evaluation_ids + train_ids)[:limit]
-        selected_samples = [sample for image_id in selected_ids for sample in grouped[image_id]]
-        if not selected_samples:
+        if not selected_ids:
             raise TrainingError("沒有可預覽的標注圖片。")
 
         from surf_track.training.action import ACTION_NAMES, predict_action_samples
 
-        probabilities = predict_action_samples(selected_samples, model_path)
-        predictions = dict(zip((str(sample["annotation_id"]) for sample in selected_samples), probabilities))
+        paths = [grouped[image_id][0]["path"] for image_id in selected_ids]
+        detector_path = self.store.data_dir / DETECTOR_MODEL_PATH
+        if detector_path.is_file():
+            # The deployed pipeline's own order: the detector finds the bodies, the action
+            # model reads each one. Human boxes would hide every miss the detector makes.
+            from surf_track.training.detector import predict_detector_images
+            from surf_track.training.stream import DETECTOR_SCORE_THRESHOLD
+
+            boxes_per_image = predict_detector_images(
+                paths, detector_path, score_threshold=DETECTOR_SCORE_THRESHOLD,
+            )
+            mode = "detector_boxes_with_action_predictions"
+            message = (
+                f"框為 detector 辨識結果（{_trained_at(detector_path)} 訓練，"
+                f"信心 ≥ {DETECTOR_SCORE_THRESHOLD:.2f}）；"
+                f"框內數字為動作模型機率（{_trained_at(model_path)} 訓練）。"
+            )
+        else:
+            boxes_per_image = [
+                [
+                    {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]}
+                    for box in grouped[image_id]
+                ]
+                for image_id in selected_ids
+            ]
+            mode = "action_predictions_on_human_boxes"
+            message = (
+                "尚未有 detector 模型，框為人工標注；"
+                f"框內數字為動作模型機率（{_trained_at(model_path)} 訓練）。"
+            )
+
+        # Flat and positional: a detected box has no annotation_id to key predictions by.
+        crops = [
+            {**box, "path": path, "labels": [0.0] * len(ACTION_NAMES)}
+            for path, boxes in zip(paths, boxes_per_image) for box in boxes
+        ]
+        probabilities = predict_action_samples(crops, model_path) if crops else []
+
         images: list[dict[str, object]] = []
-        for image_id in selected_ids:
-            boxes = grouped[image_id]
+        offset = 0
+        for image_id, boxes in zip(selected_ids, boxes_per_image):
             images.append({
                 "image_id": image_id,
                 "image_url": f"/api/v1/images/{image_id}/thumbnail",
-                "split": boxes[0]["split"],
+                "split": grouped[image_id][0]["split"],
                 "boxes": [
-                    {
-                        "x": box["x"],
-                        "y": box["y"],
-                        "width": box["width"],
-                        "height": box["height"],
-                        "probabilities": dict(zip(ACTION_NAMES, predictions[str(box["annotation_id"])])),
-                    }
-                    for box in boxes
+                    {**box, "probabilities": dict(zip(ACTION_NAMES, probabilities[offset + index]))}
+                    for index, box in enumerate(boxes)
                 ],
             })
-        return {
-            "mode": "action_predictions_on_human_boxes",
-            "message": "框為人工標注；框內數字為動作模型機率。",
-            "images": images,
-        }
+            offset += len(boxes)
+        return {"mode": mode, "message": message, "images": images}
 
     def thumbnail_path(self, image_id: str) -> str:
         from PIL import Image, ImageOps

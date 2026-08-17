@@ -661,6 +661,9 @@ function renderTrainingPreview(payload) {
       ];
       const [red, green, blue] = channels.map(([, value]) => Math.round(value * 255));
       element.style.borderColor = `rgb(${red}, ${green}, ${blue})`;
+      element.title = channels.map(([name, value]) => `${name} ${Math.round(value * 100)}%`)
+        .concat(box.score === undefined ? [] : [`偵測信心 ${Math.round(Number(box.score) * 100)}%`])
+        .join("　");
       const topValue = Math.max(...channels.map(([, value]) => value));
       if (topValue > 0.9) {
         const label = document.createElement("span");

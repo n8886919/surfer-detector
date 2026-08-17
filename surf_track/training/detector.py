@@ -80,6 +80,65 @@ def build_detector(*, trainable_stages: int = 2, weights_backbone=MobileNet_V3_L
     return model
 
 
+def load_detector(model_path):
+    """Rebuild the trained graph from the checkpoint's own record of how it was built."""
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    model = build_detector(
+        trainable_stages=int(checkpoint["trainable_stages"]), weights_backbone=None,
+    )
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+    return model, checkpoint
+
+
+def predict_detector_images(
+    paths: list, model_path, *, score_threshold: float = 0.5, batch_size: int = 4,
+) -> list[list[dict[str, float]]]:
+    """Detect surfers in whole frames, as normalised xywh boxes per frame.
+
+    Frames are downscaled the same way the training feeder downscales them — `draft` inside
+    the JPEG decoder, then an exact `thumbnail` — so the preview sees the pixels the model
+    was trained on rather than a 4K frame the model's own transform would rescale differently.
+    """
+    from PIL import Image
+    from torchvision.transforms.v2.functional import to_dtype, to_image
+
+    from surf_track.training.action import select_device
+
+    model, _ = load_detector(model_path)
+    device = select_device()
+    model.to(device)
+
+    results: list[list[dict[str, float]]] = []
+    for start in range(0, len(paths), batch_size):
+        frames = []
+        for path in paths[start:start + batch_size]:
+            with Image.open(path) as source:
+                source.draft("RGB", (INPUT_WIDTH, INPUT_HEIGHT))
+                frame = source.convert("RGB")
+                frame.thumbnail((INPUT_WIDTH, INPUT_HEIGHT))
+            frames.append(frame)
+        batch = [to_dtype(to_image(frame), torch.float32, scale=True).to(device) for frame in frames]
+        # no_grad, not inference_mode: the boxes are post-processed on the way out and
+        # inference tensors forbid the in-place writes that costs.
+        with torch.no_grad():
+            detections = model(batch)
+        for frame, found in zip(frames, detections):
+            width, height = frame.size
+            keep = found["scores"] >= score_threshold
+            results.append([
+                {
+                    "x": float(box[0]) / width,
+                    "y": float(box[1]) / height,
+                    "width": float(box[2] - box[0]) / width,
+                    "height": float(box[3] - box[1]) / height,
+                    "score": float(score),
+                }
+                for box, score in zip(found["boxes"][keep].cpu(), found["scores"][keep].cpu())
+            ])
+    return results
+
+
 class RawDetector(nn.Module):
     """backbone + head only — what a DeepStream PGIE engine should contain.
 
