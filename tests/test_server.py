@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -163,3 +164,39 @@ def test_annotation_api_persists_partial_labels(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def start_training(base_url: str, body: dict[str, object]) -> tuple[int, dict]:
+    request = Request(
+        f"{base_url}/api/v1/train",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        return error.code, json.loads(error.read().decode("utf-8"))
+
+
+def test_training_requires_a_remote_host(local_server: str) -> None:
+    """There is no local training path: without a host the request must be refused."""
+    status, payload = start_training(local_server, {"sharers": ["someone"]})
+    assert status == 409
+    assert payload["error"]["code"] == "TRAINING_NOT_STARTED"
+    assert "遠端 GPU 主機" in payload["error"]["message"]
+
+
+def test_training_requires_at_least_one_sharer(local_server: str) -> None:
+    status, payload = start_training(local_server, {"host": "user@10.0.0.1"})
+    assert status == 409
+    assert "分享者" in payload["error"]["message"]
+
+
+def test_training_rejects_ssh_option_injection_in_the_host(local_server: str) -> None:
+    status, payload = start_training(
+        local_server, {"host": "-oProxyCommand=touch /tmp/surftrack-pwned@x", "sharers": ["someone"]}
+    )
+    assert status == 409
+    assert "user@host" in payload["error"]["message"]

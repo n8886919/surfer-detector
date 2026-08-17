@@ -140,15 +140,43 @@ def test_action_samples_and_training_run_are_persisted(tmp_path: Path) -> None:
         complete_for_detection=False,
     )
 
-    samples = store.list_action_samples(str(dataset["id"]))
+    samples = store.list_action_samples(["測試分享者"])
     assert samples[0]["labels"] == [0, 0, 1]
     assert samples[0]["path"] == image_path
 
-    run = store.create_training_run(str(dataset["id"]), total_epochs=8)
+    run = store.create_training_run(["測試分享者"], total_epochs=8)
+    assert run["sharers"] == ["測試分享者"]
     updated = store.update_training_run(str(run["id"]), state="running", epoch=1, metrics={"train_loss": 0.5})
     assert updated["metrics"] == {"train_loss": 0.5}
-    with pytest.raises(StoreError, match="已經在訓練"):
-        store.create_training_run(str(dataset["id"]), total_epochs=8)
+    with pytest.raises(StoreError, match="已經有一個訓練"):
+        store.create_training_run(["測試分享者"], total_epochs=8)
+
+
+def test_action_samples_are_scoped_to_the_chosen_sharers(tmp_path: Path) -> None:
+    """Training merges every dataset belonging to the selected sharers."""
+    store = SurfTrackStore(tmp_path / "var")
+    boxes = [{"x": 0.1, "y": 0.2, "width": 0.3, "height": 0.4, "surfing": True}]
+    for index, sharer in enumerate(("分享者甲", "分享者甲", "分享者乙")):
+        dataset = store.create_dataset(
+            f"set-{index}",
+            source_provider="google_drive",
+            source_url=f"https://drive.google.com/drive/folders/1AbCdEfGhijKLMnO{index}",
+            source_title="clips",
+            sharer_name=sharer,
+            source_video_count=1,
+        )
+        path = store.media_dir / f"frame-{index}.jpg"
+        path.write_bytes(b"jpeg")
+        image = store.add_image(dataset["id"], path, source_group=f"video-{index}", split="train")
+        store.save_annotations(image["id"], boxes, complete_for_detection=False)
+
+    assert len(store.list_action_samples(["分享者甲"])) == 2
+    assert len(store.list_action_samples(["分享者乙"])) == 1
+    assert len(store.list_action_samples(["分享者甲", "分享者乙"])) == 3
+    assert len(store.list_action_samples()) == 3
+    assert store.list_action_samples([]) == []
+    with pytest.raises(TypeError):
+        store.list_action_samples("分享者甲")
 
 
 def test_existing_annotated_images_can_be_marked_detection_ready(tmp_path: Path) -> None:

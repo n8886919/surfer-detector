@@ -86,6 +86,7 @@ class SurfTrackStore:
                     crop_y REAL,
                     crop_width REAL,
                     crop_height REAL,
+                    reviewed_at TEXT,
                     created_at TEXT NOT NULL
                 );
 
@@ -120,7 +121,7 @@ class SurfTrackStore:
 
                 CREATE TABLE IF NOT EXISTS training_runs (
                     id TEXT PRIMARY KEY,
-                    dataset_id TEXT NOT NULL REFERENCES datasets(id) ON DELETE CASCADE,
+                    sharers TEXT NOT NULL DEFAULT '[]',
                     state TEXT NOT NULL,
                     epoch INTEGER NOT NULL DEFAULT 0,
                     total_epochs INTEGER NOT NULL DEFAULT 0,
@@ -137,6 +138,7 @@ class SurfTrackStore:
             self._migrate_dataset_source_fields(connection)
             self._migrate_image_crop_fields(connection)
             self._migrate_job_dataset_field(connection)
+            self._migrate_training_runs_to_sharer_scope(connection)
 
     @staticmethod
     def _migrate_dataset_source_fields(connection: sqlite3.Connection) -> None:
@@ -165,6 +167,10 @@ class SurfTrackStore:
         for column in ("crop_x", "crop_y", "crop_width", "crop_height"):
             if column not in columns:
                 connection.execute(f"ALTER TABLE images ADD COLUMN {column} REAL")
+        # Distinguishes "looked at it, nothing to box" from "never opened", which is
+        # otherwise indistinguishable and made reviewed-empty frames reappear forever.
+        if "reviewed_at" not in columns:
+            connection.execute("ALTER TABLE images ADD COLUMN reviewed_at TEXT")
 
     @staticmethod
     def _migrate_job_dataset_field(connection: sqlite3.Connection) -> None:
@@ -178,6 +184,63 @@ class SurfTrackStore:
             )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS jobs_dataset_idx ON jobs(dataset_id, updated_at DESC)"
+        )
+
+    @staticmethod
+    def _migrate_training_runs_to_sharer_scope(connection: sqlite3.Connection) -> None:
+        """A run used to target one dataset; it now covers every dataset of the chosen sharers.
+
+        `dataset_id` was NOT NULL with a CASCADE reference, so the table has to be rebuilt
+        rather than altered in place.
+        """
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(training_runs)").fetchall()
+        }
+        if "sharers" in columns:
+            return
+        historical = connection.execute(
+            """
+            SELECT r.id, r.state, r.epoch, r.total_epochs, r.metrics_json,
+                   r.created_at, r.updated_at, COALESCE(d.sharer_name, '') AS sharer_name
+              FROM training_runs r
+         LEFT JOIN datasets d ON d.id = r.dataset_id
+            """
+        ).fetchall()
+        connection.execute("DROP TABLE training_runs")
+        connection.execute(
+            """
+            CREATE TABLE training_runs (
+                id TEXT PRIMARY KEY,
+                sharers TEXT NOT NULL DEFAULT '[]',
+                state TEXT NOT NULL,
+                epoch INTEGER NOT NULL DEFAULT 0,
+                total_epochs INTEGER NOT NULL DEFAULT 0,
+                metrics_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO training_runs(
+                id, sharers, state, epoch, total_epochs, metrics_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    row["id"],
+                    json.dumps([row["sharer_name"]] if row["sharer_name"] else [], ensure_ascii=False),
+                    row["state"],
+                    row["epoch"],
+                    row["total_epochs"],
+                    row["metrics_json"],
+                    row["created_at"],
+                    row["updated_at"],
+                )
+                for row in historical
+            ],
         )
 
     def recover_interrupted_jobs(self) -> int:
@@ -239,26 +302,26 @@ class SurfTrackStore:
             job["resumable"] = bool(job["resumable"])
         for run in runs:
             run["metrics"] = json.loads(str(run.pop("metrics_json")))
+            run["sharers"] = json.loads(str(run.pop("sharers")))
         return {"datasets": datasets, "jobs": jobs, "training_runs": runs}
 
-    def create_training_run(self, dataset_id: str, *, total_epochs: int) -> dict[str, object]:
-        self.get_dataset(dataset_id)
+    def create_training_run(self, sharers: list[str], *, total_epochs: int) -> dict[str, object]:
         now = self._now()
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         with self._connect() as connection:
+            # One combined model and one remote GPU, so one run at a time.
             active = connection.execute(
-                "SELECT 1 FROM training_runs WHERE dataset_id = ? AND state IN ('queued', 'running')",
-                (dataset_id,),
+                "SELECT 1 FROM training_runs WHERE state IN ('queued', 'running')"
             ).fetchone()
             if active is not None:
-                raise StoreError("這個 Dataset 已經在訓練。")
+                raise StoreError("已經有一個訓練在進行中。")
             connection.execute(
                 """
                 INSERT INTO training_runs(
-                    id, dataset_id, state, epoch, total_epochs, metrics_json, created_at, updated_at
+                    id, sharers, state, epoch, total_epochs, metrics_json, created_at, updated_at
                 ) VALUES (?, ?, 'queued', 0, ?, '{}', ?, ?)
                 """,
-                (run_id, dataset_id, total_epochs, now, now),
+                (run_id, json.dumps(sharers, ensure_ascii=False), total_epochs, now, now),
             )
         return self.get_training_run(run_id)
 
@@ -269,6 +332,7 @@ class SurfTrackStore:
             raise StoreError("找不到這個訓練工作。")
         result = dict(row)
         result["metrics"] = json.loads(str(result.pop("metrics_json")))
+        result["sharers"] = json.loads(str(result.pop("sharers")))
         return result
 
     def update_training_run(
@@ -292,20 +356,32 @@ class SurfTrackStore:
                 raise StoreError("找不到這個訓練工作。")
         return self.get_training_run(run_id)
 
-    def list_action_samples(self, dataset_id: str) -> list[dict[str, object]]:
-        self.get_dataset(dataset_id)
+    def list_action_samples(self, sharers: list[str] | None = None) -> list[dict[str, object]]:
+        """Every annotated box, optionally narrowed to the datasets of the given sharers."""
+        if isinstance(sharers, str):
+            # A bare string would be iterated character by character into placeholders.
+            raise TypeError("sharers must be a list of sharer names, not a single string")
+        clause = ""
+        parameters: tuple[object, ...] = ()
+        if sharers is not None:
+            if not sharers:
+                return []
+            placeholders = ",".join("?" for _ in sharers)
+            clause = f" WHERE d.sharer_name IN ({placeholders})"
+            parameters = tuple(sharers)
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT i.id AS image_id, i.local_path, i.split,
                        a.id AS annotation_id, a.x, a.y, a.width, a.height,
                        a.chasing_wave, a.takeoff, a.surfing
                   FROM images i
+                  JOIN datasets d ON d.id = i.dataset_id
                   JOIN annotations a ON a.image_id = i.id
-                 WHERE i.dataset_id = ?
+                {clause}
               ORDER BY i.created_at, a.id
                 """,
-                (dataset_id,),
+                parameters,
             ).fetchall()
         return [
             {
@@ -600,6 +676,7 @@ class SurfTrackStore:
                 "width": row["width"],
                 "height": row["height"],
                 "complete_for_detection": bool(row["complete_for_detection"]),
+                "reviewed": row["reviewed_at"] is not None,
                 "annotation_count": row["annotation_count"],
                 "image_url": f"/api/v1/images/{row['id']}/content",
             }
@@ -725,7 +802,7 @@ class SurfTrackStore:
                 """
                 UPDATE images
                    SET complete_for_detection = ?, crop_x = ?, crop_y = ?,
-                       crop_width = ?, crop_height = ?
+                       crop_width = ?, crop_height = ?, reviewed_at = ?
                  WHERE id = ?
                 """,
                 (
@@ -734,6 +811,7 @@ class SurfTrackStore:
                     normalized_crop["y"] if normalized_crop else None,
                     normalized_crop["width"] if normalized_crop else None,
                     normalized_crop["height"] if normalized_crop else None,
+                    now,
                     image_id,
                 ),
             )
@@ -742,5 +820,6 @@ class SurfTrackStore:
             "annotation_count": len(normalized),
             "complete_for_detection": complete_for_detection,
             "crop_region": normalized_crop,
+            "reviewed_at": now,
             "saved_at": now,
         }

@@ -1,19 +1,41 @@
 from __future__ import annotations
 
-import copy
-import random
+import os
 from pathlib import Path
 
 import torch
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+from torchvision.models import mobilenet_v3_small
 
 from surf_track.training.augmentation import action_transform
 
 
 ACTION_NAMES = ("chasing_wave", "takeoff", "surfing")
+
+
+def select_device() -> torch.device:
+    """CUDA when available; `SURF_TRACK_DEVICE` overrides for debugging or CPU-only hosts."""
+    override = os.environ.get("SURF_TRACK_DEVICE")
+    if override:
+        return torch.device(override)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def crop_for_sample(image: Image.Image, sample: dict[str, object]) -> Image.Image:
+    """The padded body crop an action model sees for one annotation."""
+    width, height = image.size
+    box_width = float(sample["width"]) * width
+    box_height = float(sample["height"]) * height
+    center_x = (float(sample["x"]) + float(sample["width"]) / 2) * width
+    center_y = (float(sample["y"]) + float(sample["height"]) / 2) * height
+    side = max(box_width, box_height) * 1.55
+    left = max(0, center_x - side / 2)
+    top = max(0, center_y - side / 2)
+    right = min(width, center_x + side / 2)
+    bottom = min(height, center_y + side / 2)
+    return image.crop((left, top, right, bottom))
 
 
 class ActionCropDataset(Dataset):
@@ -27,25 +49,22 @@ class ActionCropDataset(Dataset):
     def __getitem__(self, index: int):
         sample = self.samples[index]
         with Image.open(Path(sample["path"])) as source:
-            image = source.convert("RGB")
-            width, height = image.size
-            box_width = float(sample["width"]) * width
-            box_height = float(sample["height"]) * height
-            center_x = (float(sample["x"]) + float(sample["width"]) / 2) * width
-            center_y = (float(sample["y"]) + float(sample["height"]) / 2) * height
-            side = max(box_width, box_height) * 1.55
-            left = max(0, center_x - side / 2)
-            top = max(0, center_y - side / 2)
-            right = min(width, center_x + side / 2)
-            bottom = min(height, center_y + side / 2)
-            crop = image.crop((left, top, right, bottom))
+            crop = crop_for_sample(source.convert("RGB"), sample)
         return self.transform(crop), torch.tensor(sample["labels"], dtype=torch.float32)
 
 
-def _f1_scores(targets: torch.Tensor, logits: torch.Tensor) -> list[float]:
+def f1_scores(targets: torch.Tensor, logits: torch.Tensor) -> tuple[list[float], list[int]]:
+    """Per-class F1 plus how many positives each class actually had in this split.
+
+    A class with no positives scores 0.0, which reads as total failure but really means
+    "not measurable". Callers must report the counts so the two can be told apart. Never
+    return a non-finite value: these end up in metrics_json, and `json.dumps` would emit a
+    bare `NaN` that breaks `JSON.parse` in the Train page.
+    """
     predictions = logits.sigmoid() >= 0.5
     truth = targets >= 0.5
     scores: list[float] = []
+    positives: list[int] = []
     for index in range(len(ACTION_NAMES)):
         predicted = predictions[:, index]
         actual = truth[:, index]
@@ -54,7 +73,14 @@ def _f1_scores(targets: torch.Tensor, logits: torch.Tensor) -> list[float]:
         false_negative = int((~predicted & actual).sum())
         denominator = 2 * true_positive + false_positive + false_negative
         scores.append((2 * true_positive / denominator) if denominator else 0.0)
-    return scores
+        positives.append(int(actual.sum()))
+    return scores, positives
+
+
+def macro_f1(scores: list[float], positives: list[int]) -> float:
+    """Average only over classes that had positives, so an absent class cannot drag it down."""
+    measured = [score for score, count in zip(scores, positives) if count]
+    return sum(measured) / len(measured) if measured else 0.0
 
 
 def predict_action_samples(samples: list[dict[str, object]], model_path: Path) -> list[list[float]]:
@@ -62,88 +88,13 @@ def predict_action_samples(samples: list[dict[str, object]], model_path: Path) -
     model = mobilenet_v3_small(weights=None)
     model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, len(ACTION_NAMES))
     model.load_state_dict(checkpoint["model"])
+    device = select_device()
+    model.to(device)
     model.eval()
     loader = DataLoader(ActionCropDataset(samples, training=False), batch_size=32, num_workers=0)
     probabilities: list[list[float]] = []
     with torch.inference_mode():
         for images, _targets in loader:
-            probabilities.extend(model(images).sigmoid().tolist())
+            probabilities.extend(model(images.to(device)).sigmoid().tolist())
     return probabilities
 
-
-def train_action_model(
-    samples: list[dict[str, object]],
-    output_path: Path,
-    *,
-    epochs: int,
-    on_epoch,
-) -> dict[str, float]:
-    random.seed(42)
-    torch.manual_seed(42)
-    grouped = {split: [sample for sample in samples if sample["split"] == split] for split in ("train", "valid", "test")}
-    if len(grouped["train"]) < 12 or len(grouped["valid"]) < 3:
-        raise ValueError("至少需要 12 個 train 框和 3 個 valid 框才能開始動作訓練。")
-
-    train_loader = DataLoader(ActionCropDataset(grouped["train"], training=True), batch_size=16, shuffle=True, num_workers=0)
-    valid_loader = DataLoader(ActionCropDataset(grouped["valid"], training=False), batch_size=32, num_workers=0)
-
-    weights = MobileNet_V3_Small_Weights.DEFAULT
-    model = mobilenet_v3_small(weights=weights)
-    for parameter in model.features.parameters():
-        parameter.requires_grad = False
-    for block in model.features[-3:]:
-        for parameter in block.parameters():
-            parameter.requires_grad = True
-    model.classifier[-1] = nn.Linear(model.classifier[-1].in_features, len(ACTION_NAMES))
-
-    positives = torch.tensor([
-        sum(int(sample["labels"][index]) for sample in grouped["train"])
-        for index in range(len(ACTION_NAMES))
-    ], dtype=torch.float32)
-    negatives = len(grouped["train"]) - positives
-    loss_function = nn.BCEWithLogitsLoss(pos_weight=(negatives / positives.clamp_min(1)).clamp(max=12))
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=8e-4, weight_decay=1e-4)
-
-    best_score = -1.0
-    best_state = None
-    best_metrics: dict[str, float] = {}
-    for epoch in range(1, epochs + 1):
-        model.train()
-        loss_total = 0.0
-        for images, targets in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss = loss_function(model(images), targets)
-            loss.backward()
-            optimizer.step()
-            loss_total += float(loss.detach()) * len(images)
-
-        model.eval()
-        all_targets: list[torch.Tensor] = []
-        all_logits: list[torch.Tensor] = []
-        with torch.inference_mode():
-            for images, targets in valid_loader:
-                all_targets.append(targets)
-                all_logits.append(model(images))
-        scores = _f1_scores(torch.cat(all_targets), torch.cat(all_logits))
-        metrics = {
-            "train_loss": loss_total / len(grouped["train"]),
-            "action_macro_f1": sum(scores) / len(scores),
-            **{f"{name}_f1": score for name, score in zip(ACTION_NAMES, scores)},
-            "train_boxes": float(len(grouped["train"])),
-            "valid_boxes": float(len(grouped["valid"])),
-        }
-        if metrics["action_macro_f1"] >= best_score:
-            best_score = metrics["action_macro_f1"]
-            best_state = copy.deepcopy(model.state_dict())
-            best_metrics = metrics
-        on_epoch(epoch, metrics)
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
-        "model": best_state,
-        "architecture": "mobilenet_v3_small",
-        "actions": ACTION_NAMES,
-        "image_size": 160,
-        "metrics": best_metrics,
-    }, output_path)
-    return best_metrics

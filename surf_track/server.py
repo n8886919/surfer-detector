@@ -45,10 +45,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         if path == "/api/v1/workspace":
             self._send_json(self.server.store.workspace_snapshot())  # type: ignore[attr-defined]
             return
-        preview_match = re.fullmatch(r"/api/v1/datasets/([A-Za-z0-9_-]+)/training-preview", path)
-        if preview_match:
+        if path == "/api/v1/training-preview":
             try:
-                result = self.server.training_manager.preview(preview_match.group(1))  # type: ignore[attr-defined]
+                result = self.server.training_manager.preview()  # type: ignore[attr-defined]
                 self._send_json(result)
             except (TrainingError, StoreError) as exc:
                 self._send_json(
@@ -120,18 +119,33 @@ class RequestHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CONFLICT,
                 )
             return
-        train_match = re.fullmatch(r"/api/v1/datasets/([A-Za-z0-9_-]+)/train", path)
-        if train_match:
-            try:
-                run = self.server.training_manager.start(train_match.group(1))  # type: ignore[attr-defined]
-                self._send_json({"run": run}, HTTPStatus.ACCEPTED)
-            except (TrainingError, StoreError) as exc:
-                self._send_json(
-                    {"error": {"code": "TRAINING_NOT_STARTED", "message": str(exc)}},
-                    HTTPStatus.CONFLICT,
-                )
+        if path == "/api/v1/train":
+            self._start_training()
             return
         self._send_json({"error": {"code": "NOT_FOUND", "message": "找不到這個 API。"}}, HTTPStatus.NOT_FOUND)
+
+    def _start_training(self) -> None:
+        """Training always runs on a remote CUDA host; there is no local fallback."""
+        try:
+            payload = self._read_json()
+            host = payload.get("host")
+            if not isinstance(host, str) or not host.strip():
+                raise TrainingError("請先填入遠端 GPU 主機，格式為 user@host。")
+            sharers = payload.get("sharers")
+            if not isinstance(sharers, list) or not all(isinstance(name, str) for name in sharers):
+                raise TrainingError("請至少勾選一位分享者的資料集。")
+            run = self.server.training_manager.start(sharers, host=host)  # type: ignore[attr-defined]
+            self._send_json({"run": run}, HTTPStatus.ACCEPTED)
+        except (TrainingError, StoreError) as exc:
+            self._send_json(
+                {"error": {"code": "TRAINING_NOT_STARTED", "message": str(exc)}},
+                HTTPStatus.CONFLICT,
+            )
+        except (ValueError, json.JSONDecodeError):
+            self._send_json(
+                {"error": {"code": "INVALID_JSON", "message": "請求內容不是有效的 JSON。"}},
+                HTTPStatus.BAD_REQUEST,
+            )
 
     def _create_dataset(self) -> None:
         try:

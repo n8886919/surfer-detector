@@ -4,6 +4,7 @@ const ACTIONS = {
   r: { field: "surfing", label: "衝浪" },
 };
 const SHARER_MEMORY_KEY = "surftrack.lastSharerName";
+const TRAIN_HOST_MEMORY_KEY = "surftrack.trainHost";
 
 function rememberedSharerName() {
   try {
@@ -23,9 +24,49 @@ function rememberSharerName(value) {
   }
 }
 
+function rememberedTrainHost() {
+  try {
+    return localStorage.getItem(TRAIN_HOST_MEMORY_KEY) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function rememberTrainHost(value) {
+  try {
+    const cleaned = value.trim();
+    if (cleaned) localStorage.setItem(TRAIN_HOST_MEMORY_KEY, cleaned);
+    else localStorage.removeItem(TRAIN_HOST_MEMORY_KEY);
+  } catch (_) {
+    // Browser storage can be disabled; the host just has to be retyped each session.
+  }
+}
+
+const SELECTED_SHARERS_MEMORY_KEY = "surftrack.trainSharers";
+const UNNAMED_SHARER = "舊資料未填分享者";
+
+function rememberedSelectedSharers() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SELECTED_SHARERS_MEMORY_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((name) => typeof name === "string") : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function rememberSelectedSharers() {
+  try {
+    localStorage.setItem(SELECTED_SHARERS_MEMORY_KEY, JSON.stringify([...state.selectedSharers]));
+  } catch (_) {
+    // Browser storage can be disabled; the selection just resets next session.
+  }
+}
+
 const state = {
   config: null,
   workspace: { datasets: [], jobs: [], training_runs: [] },
+  selectedSharers: new Set(),
+  sharerListSignature: null,
   scan: null,
   labelImages: [],
   currentImage: null,
@@ -82,7 +123,9 @@ const elements = {
   appVersion: document.querySelector("#app-version"),
   toast: document.querySelector("#toast"),
   labelDatasetSelect: document.querySelector("#label-dataset-select"),
-  trainDatasetSelect: document.querySelector("#dataset-select"),
+  sharerList: document.querySelector("#sharer-list"),
+  sharerSummary: document.querySelector("#sharer-summary"),
+  trainHost: document.querySelector("#train-host"),
   startTrainButton: document.querySelector("#start-train-button"),
   trainStatus: document.querySelector("#train-status"),
   previewStatus: document.querySelector("#preview-status"),
@@ -312,7 +355,87 @@ function jobStateLabel(job) {
   }[job.state] || job.state;
 }
 
+function sharerLabel(dataset) {
+  return dataset.sharer_name || UNNAMED_SHARER;
+}
+
+function sharerGroups() {
+  const groups = new Map();
+  for (const dataset of state.workspace.datasets) {
+    const name = sharerLabel(dataset);
+    const group = groups.get(name) || { name, datasets: 0, images: 0, labeled: 0 };
+    group.datasets += 1;
+    group.images += Number(dataset.image_count || 0);
+    group.labeled += Number(dataset.labeled_image_count || 0);
+    groups.set(name, group);
+  }
+  return [...groups.values()].sort((first, second) => second.labeled - first.labeled);
+}
+
+function updateSharerSummary() {
+  const chosen = sharerGroups().filter((group) => state.selectedSharers.has(group.name));
+  const labeled = chosen.reduce((total, group) => total + group.labeled, 0);
+  elements.sharerSummary.textContent = chosen.length
+    ? `已選 ${chosen.length} 位 · ${labeled} 張已標圖片`
+    : "尚未勾選分享者";
+}
+
+function renderSharerList() {
+  const groups = sharerGroups();
+  // loadWorkspace polls every 2s; only rebuild when the sharers actually changed, so a
+  // click is never swallowed by a re-render.
+  const signature = groups.map((g) => `${g.name}:${g.datasets}:${g.images}:${g.labeled}`).join("|");
+  if (signature === state.sharerListSignature) {
+    updateSharerSummary();
+    return;
+  }
+  state.sharerListSignature = signature;
+  for (const name of [...state.selectedSharers]) {
+    if (!groups.some((group) => group.name === name)) state.selectedSharers.delete(name);
+  }
+
+  elements.sharerList.replaceChildren();
+  if (!groups.length) {
+    const empty = document.createElement("div");
+    empty.className = "empty-row";
+    empty.innerHTML = "<strong>尚未建立 Dataset</strong><small>先在 Data 頁建立並處理資料集。</small>";
+    elements.sharerList.appendChild(empty);
+    updateSharerSummary();
+    return;
+  }
+
+  for (const group of groups) {
+    const row = document.createElement("label");
+    row.className = "sharer-row";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = state.selectedSharers.has(group.name);
+    row.classList.toggle("checked", box.checked);
+    box.addEventListener("change", () => {
+      if (box.checked) state.selectedSharers.add(group.name);
+      else state.selectedSharers.delete(group.name);
+      row.classList.toggle("checked", box.checked);
+      rememberSelectedSharers();
+      updateSharerSummary();
+      renderLatestTrainingRun();
+    });
+    const text = document.createElement("div");
+    const strong = document.createElement("strong");
+    strong.textContent = group.name;
+    const small = document.createElement("small");
+    small.textContent = `${group.datasets} 個 Dataset · ${group.labeled}/${group.images} 張已標`;
+    text.append(strong, small);
+    const count = document.createElement("span");
+    count.className = "job-state";
+    count.textContent = `${group.labeled} 張`;
+    row.append(box, text, count);
+    elements.sharerList.appendChild(row);
+  }
+  updateSharerSummary();
+}
+
 function renderJobs() {
+  const datasetNames = new Map(state.workspace.datasets.map((dataset) => [dataset.id, dataset.name]));
   elements.jobsList.replaceChildren();
   if (!state.workspace.jobs.length) {
     const empty = document.createElement("div");
@@ -329,9 +452,11 @@ function renderJobs() {
     const name = document.createElement("div");
     name.className = "job-name";
     const strong = document.createElement("strong");
-    strong.textContent = job.job_type === "ingest" ? "下載與抽圖" : job.job_type;
+    strong.textContent = datasetNames.get(job.dataset_id)
+      || (job.dataset_id ? "（資料集已刪除）" : "（舊工作未記錄資料集）");
     const small = document.createElement("small");
-    small.textContent = job.message || job.step;
+    const kind = job.job_type === "ingest" ? "下載與抽圖" : job.job_type;
+    small.textContent = `${kind} · ${job.message || job.step}`;
     name.append(strong, small);
     const progress = document.createElement("div");
     progress.innerHTML = `<div class="job-progress-track"><i style="width:${percentage}%"></i></div><div class="job-progress-meta"><span>${job.completed_items} / ${job.total_items}</span><span>${percentage}%</span></div>`;
@@ -349,37 +474,26 @@ function populateDatasetSelectors() {
     rememberSharerName(datasets[0].sharer_name);
   }
   const previousLabel = elements.labelDatasetSelect.value;
-  const previousTrain = elements.trainDatasetSelect.value;
   elements.labelDatasetSelect.replaceChildren();
-  elements.trainDatasetSelect.replaceChildren();
   if (!datasets.length) {
-    for (const select of [elements.labelDatasetSelect, elements.trainDatasetSelect]) {
-      const option = document.createElement("option");
-      option.value = "";
-      option.textContent = "尚未建立 Dataset";
-      select.appendChild(option);
-      select.disabled = true;
-    }
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "尚未建立 Dataset";
+    elements.labelDatasetSelect.appendChild(option);
+    elements.labelDatasetSelect.disabled = true;
   } else {
     elements.labelDatasetSelect.disabled = false;
-    elements.trainDatasetSelect.disabled = false;
     for (const dataset of datasets) {
       const total = Number(dataset.image_count || 0);
       const labeled = Number(dataset.labeled_image_count || 0);
       const percentage = total ? Math.round(labeled / total * 100) : 0;
       const labelOption = document.createElement("option");
       labelOption.value = dataset.id;
-      labelOption.textContent = `${dataset.name} · ${labeled}/${total} 已標 (${percentage}%)`;
+      labelOption.textContent = `${dataset.name} · ${sharerLabel(dataset)} · ${labeled}/${total} 已標 (${percentage}%)`;
       elements.labelDatasetSelect.appendChild(labelOption);
-
-      const trainOption = document.createElement("option");
-      trainOption.value = dataset.id;
-      trainOption.textContent = `${dataset.name} · ${dataset.sharer_name || "舊資料未填分享者"} · ${total} 張`;
-      elements.trainDatasetSelect.appendChild(trainOption);
     }
   }
   if (datasets.some((dataset) => dataset.id === previousLabel)) elements.labelDatasetSelect.value = previousLabel;
-  if (datasets.some((dataset) => dataset.id === previousTrain)) elements.trainDatasetSelect.value = previousTrain;
 
   const previousIngest = elements.ingestDatasetSelect.value;
   elements.ingestDatasetSelect.replaceChildren();
@@ -460,9 +574,10 @@ async function startIngest() {
 }
 
 function renderLatestTrainingRun() {
-  const run = state.workspace.training_runs.find((item) => item.dataset_id === elements.trainDatasetSelect.value)
-    || state.workspace.training_runs[0];
-  elements.startTrainButton.disabled = !elements.trainDatasetSelect.value || ["queued", "running"].includes(run?.state);
+  const run = state.workspace.training_runs[0];
+  elements.startTrainButton.disabled = !state.selectedSharers.size
+    || !elements.trainHost.value.trim()
+    || ["queued", "running"].includes(run?.state);
   elements.startTrainButton.textContent = ["queued", "running"].includes(run?.state)
     ? `訓練中 ${run.epoch} / ${run.total_epochs}`
     : "Train 小模型";
@@ -491,15 +606,21 @@ function renderLatestTrainingRun() {
 }
 
 async function startTraining() {
-  const datasetId = elements.trainDatasetSelect.value;
-  if (!datasetId || elements.startTrainButton.disabled) return;
+  const host = elements.trainHost.value.trim();
+  const sharers = [...state.selectedSharers];
+  if (!sharers.length || !host || elements.startTrainButton.disabled) return;
   elements.startTrainButton.disabled = true;
   elements.startTrainButton.textContent = "啟動中…";
   try {
-    const response = await fetch(`/api/v1/datasets/${datasetId}/train`, { method: "POST" });
+    const response = await fetch("/api/v1/train", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ host, sharers }),
+    });
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || "無法開始訓練。");
-    elements.trainStatus.textContent = "已在背景訓練，可以切到其他頁面。";
+    rememberTrainHost(host);
+    elements.trainStatus.textContent = `已在 ${host} 的 GPU 上背景訓練，可以切到其他頁面。`;
     state.previewKey = null;
     await loadWorkspace();
   } catch (error) {
@@ -545,15 +666,14 @@ function renderTrainingPreview(payload) {
 }
 
 async function loadTrainingPreview() {
-  const datasetId = elements.trainDatasetSelect.value;
-  const run = state.workspace.training_runs.find((item) => item.dataset_id === datasetId && item.state === "completed");
-  if (!datasetId || !run || state.previewLoading) return;
-  const key = `${datasetId}:${run.id}`;
+  const run = state.workspace.training_runs.find((item) => item.state === "completed");
+  if (!run || state.previewLoading) return;
+  const key = run.id;
   if (state.previewKey === key) return;
   state.previewLoading = true;
   elements.previewStatus.textContent = "辨識中…";
   try {
-    const response = await fetch(`/api/v1/datasets/${datasetId}/training-preview`);
+    const response = await fetch("/api/v1/training-preview");
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error?.message || "無法產生辨識預覽。");
     renderTrainingPreview(payload);
@@ -575,6 +695,7 @@ async function loadWorkspace() {
     state.workspace = await response.json();
     renderJobs();
     populateDatasetSelectors();
+    renderSharerList();
     renderLatestTrainingRun();
     if (document.querySelector("#train-page").classList.contains("active")) loadTrainingPreview();
   } catch (_) {
@@ -889,6 +1010,7 @@ async function saveCurrentAnnotations() {
     if (!response.ok) throw new Error(payload.error?.message || "保存失敗");
     state.currentImage.annotation_count = payload.annotation_count;
     state.currentImage.complete_for_detection = payload.complete_for_detection;
+    state.currentImage.reviewed = true;
     state.cropRegion = payload.crop_region;
     setAutosaveState("saved", hasIncompleteBoxes() ? "等待 W/E/R" : "已保存");
     updateLabelProgress();
@@ -902,7 +1024,8 @@ async function saveCurrentAnnotations() {
 
 function updateLabelProgress() {
   const labeled = state.labelImages.filter((image) => Number(image.annotation_count) > 0).length;
-  elements.labelProgressCount.textContent = `${labeled} / ${state.labelImages.length}`;
+  const reviewed = state.labelImages.filter((image) => image.reviewed || Number(image.annotation_count) > 0).length;
+  elements.labelProgressCount.textContent = `${labeled} 已標 · ${reviewed} 已看 / ${state.labelImages.length}`;
   if (!state.currentImage) {
     elements.labelImagePosition.textContent = "— / —";
     return;
@@ -1052,8 +1175,9 @@ async function randomNextImage({ saveCurrent = true } = {}) {
   }
   const candidates = state.labelImages.filter((image) => image.id !== state.currentImage?.id);
   if (!candidates.length) return;
-  const unlabeled = candidates.filter((image) => Number(image.annotation_count) === 0);
-  const pool = unlabeled.length ? unlabeled : candidates;
+  // Reviewed-but-empty frames are done, not pending; without this they kept coming back.
+  const untouched = candidates.filter((image) => Number(image.annotation_count) === 0 && !image.reviewed);
+  const pool = untouched.length ? untouched : candidates;
   const next = pool[Math.floor(Math.random() * pool.length)];
   await openLabelImage(next.id, { saveCurrent });
 }
@@ -1156,11 +1280,7 @@ elements.connectDriveButton.addEventListener("click", () => {
 });
 elements.ingestDatasetSelect.addEventListener("change", updateIngestButton);
 elements.startIngestButton.addEventListener("click", startIngest);
-elements.trainDatasetSelect.addEventListener("change", () => {
-  state.previewKey = null;
-  renderLatestTrainingRun();
-  loadTrainingPreview();
-});
+elements.trainHost.addEventListener("input", renderLatestTrainingRun);
 elements.startTrainButton.addEventListener("click", startTraining);
 elements.labelDatasetSelect.addEventListener("change", (event) => {
   state.loadedLabelDatasetId = null;
@@ -1177,6 +1297,11 @@ elements.annotationLayer.addEventListener("pointercancel", finishBox);
 elements.labelStage.addEventListener("wheel", handleLabelWheel, { passive: false });
 elements.actionButtons.forEach((button) => button.addEventListener("click", () => toggleAction(button.dataset.action)));
 document.addEventListener("keydown", handleLabelKey);
+
+// Prefilled once here, never from renderLatestTrainingRun: loadWorkspace polls every 2s
+// and would overwrite the host while it is being typed.
+elements.trainHost.value = rememberedTrainHost();
+state.selectedSharers = rememberedSelectedSharers();
 
 const initialPage = ["dataset", "label", "train"].includes(location.hash.slice(1)) ? location.hash.slice(1) : "dataset";
 selectPage(initialPage);

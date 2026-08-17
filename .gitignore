@@ -1,41 +1,35 @@
+# Python
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
 .coverage
-htmlcov/
-*.egg-info/
 build/
 dist/
 
-# Local editor and OS files
+# Editor and OS
 .DS_Store
 .idea/
 .vscode/
 *.log
 
-# Runtime data will be local and must not be committed.
-data/
+# Runtime data: DB, videos, frames, models, credentials
 var/
+data/
 
-# Generated training runs and model artifacts
-runs/
-wandb/
-checkpoints/
-artifacts/
-*.ckpt
-*.engine
-*.onnx
+# Model artifacts anywhere in the tree
 *.pt
 *.pth
+*.ckpt
+*.onnx
+*.engine
 *.safetensors
 
 # Credentials
 .env
 .env.*
 !.env.example
-var/secrets/
 *.token.json
 rclone.conf

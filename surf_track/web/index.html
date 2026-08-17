@@ -117,7 +117,7 @@
       <section class="page" id="label-page" data-page-panel="label" hidden>
         <div class="page-head section-head">
           <div><h1>Label</h1><p>拉框後用 W/E/R 切換狀態。</p></div>
-          <span><b id="label-progress-count">0 / 0</b> 已標圖片 · <span class="autosave-state" id="autosave-state">已保存</span></span>
+          <span><b id="label-progress-count">0 已標 · 0 已看 / 0</b> 影格 · <span class="autosave-state" id="autosave-state">已保存</span></span>
         </div>
 
         <section class="panel label-controls">
@@ -160,14 +160,22 @@
 
       <section class="page" id="train-page" data-page-panel="train" hidden>
         <div class="page-head"><h1>Train</h1><p>Surfer detector + 三項獨立動作分類。</p></div>
+        <section class="panel">
+          <div class="section-head">
+            <h2>訓練資料</h2>
+            <span id="sharer-summary">尚未建立 Dataset</span>
+          </div>
+          <p class="hint">勾選要納入的分享者；所有勾選的資料集會合併成一個模型。</p>
+          <div class="sharer-list" id="sharer-list"></div>
+        </section>
         <section class="panel train-controls">
           <div>
-            <label for="dataset-select">Dataset</label>
-            <select id="dataset-select" disabled><option value="">尚未建立 Dataset</option></select>
+            <label for="train-host">遠端 GPU 主機</label>
+            <input id="train-host" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="user@192.168.1.100">
           </div>
           <button class="primary-button" id="start-train-button" type="button">Train 小模型</button>
           <span class="hint">目標：Jetson Orin Nano 8GB · 單路 · 10 Hz</span>
-          <span class="hint" id="train-status">已保存的標注圖片會用於 detector 與動作分類。</span>
+          <span class="hint" id="train-status">訓練只在遠端 GPU 執行；影格留在本機，只串流 crop。</span>
         </section>
         <section class="panel training-overview">
           <div class="section-head"><h2>最新結果</h2><span id="latest-run-state">尚未訓練</span></div>

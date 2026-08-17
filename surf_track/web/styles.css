@@ -131,6 +131,11 @@ kbd { display: inline-grid; min-width: 24px; min-height: 24px; place-items: cent
 .complete-toggle input { width: auto; min-height: auto; }
 
 .train-controls { display: grid; grid-template-columns: minmax(220px, 1fr) auto auto; align-items: end; gap: 12px; }
+.sharer-list { display: grid; gap: 7px; margin-top: 14px; }
+.sharer-row { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 10px; border: 1px solid var(--line); border-radius: 4px; padding: 10px; }
+.sharer-row.checked { border-color: var(--accent); background: var(--accent-soft); }
+.sharer-row strong { display: block; }
+.sharer-row small { display: block; color: var(--muted); }
 .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; margin-top: 18px; background: var(--line); }
 .metric-grid article { padding: 16px; background: #fff; }
 .metric-grid span { display: block; color: var(--muted); font-size: 12px; }

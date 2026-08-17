@@ -1,64 +1,88 @@
 # SurfTrack
 
-SurfTrack 是一個個人開源專案，用來建立可部署至 Jetson Orin Nano 8GB 的 surfer 即時辨識模型。
+個人專案：建立可部署到 Jetson Orin Nano 8GB 的 surfer 即時辨識模型，並提供從
+收集影片 → 標注 → 訓練的單頁本機 UI。
 
-目前固定範圍：
+固定範圍：單路相機、10 Hz；找出畫面中所有 surfer，bbox 只框人物身體；每個 bbox 輸出
+「追浪／起乘／衝浪」三項獨立機率。不負責選擇跟拍目標、控制相機或辨識身分。
 
-- 單路相機，模型處理目標 10 Hz。
-- 找出畫面中所有 surfer，bbox 只框人物身體。
-- 每個 bbox 輸出「追浪／起乘／衝浪」三項獨立機率。
-- 不負責選擇跟拍目標、控制相機或辨識人物身分。
-- 來源可為公開 Google Drive，或目前登入帳號可查看的 Facebook 貼文。
+## 快速開始
 
-## 安裝與啟動 UI
-
-只需要 Python 3.11；專案不使用大型 Web framework：
+只需要 Python 3.11，沒有 Web framework（stdlib `http.server` + 原生 JS）：
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e .
-./surftrack.py
+.venv/bin/pip install -e .          # 加 '.[train]' 才會裝 torch，訓練才需要
+./surftrack.py                      # http://127.0.0.1:8080
+.venv/bin/pytest -q
 ```
 
-開啟 <http://127.0.0.1:8080>。
+抽影格需要 `ffmpeg` 在 PATH 上。
 
-若系統已經將 `python` 指向 Python 3，也可以使用：
+## 使用流程
+
+1. **Data**：貼上公開 Google Drive 或 Facebook 貼文連結 → 掃描 → 建立 Dataset
+   （必填分享者名稱）→ Ingest 下載影片並以 1 fps 抽影格。
+2. **Label**：拉框、`W`/`E`/`R` 切換三種動作、空白鍵存檔跳下一張。
+3. **Train**：勾選分享者，所有勾選的資料集合併成一個 MobileNetV3-Small 動作分類器，
+   模型寫到 `var/models/action/`。訓練只在遠端 CUDA 主機執行（UI 需填 `user@host`），
+   影格留在本機，只把 crop 逐 batch 串過去；checkpoint 串回本機。
+
+同樣的訓練也可以從 CLI 跑，`--sharer` 可重複：
 
 ```bash
-python ./surftrack.py
+python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@192.168.x.x
 ```
 
-目前這台開發環境沒有 `python` alias，所以實際使用 `./surftrack.py` 或 `python3 ./surftrack.py`。
+## Orin 部署契約
 
-安裝時會加入小型 `gdown` 依賴，用來直接列出及下載「知道連結的任何人」可存取的 Drive 來源，不需要來源 Google 帳號或 API key。若尚未安裝依賴，UI 仍可驗證 Drive 連結格式，但不會假裝已經掃描影片。
+寫在這裡是因為兩者都很容易在部署時踩到，而且事後很難察覺：
 
-Facebook 連結輸入目前會完成格式辨識、移除 `__cft__`、`__tn__` 等追蹤參數，並拒絕任何帶有 token、cookie 或 session 的網址。尚未接入 Facebook 登入與影片下載；後續只允許 SurfTrack 專用的隔離瀏覽器 profile，不讀取日常瀏覽器 cookies，也不把 cookies 寫入專案。
+- **SGIE 前必須用 pad probe 把偵測框擴成 `max(w, h) * 1.55` 的正方形**，不要用 nvinfer
+  的非等比縮放（`maintain-aspect-ratio=0` 是預設值）。訓練時的 crop 是正方形，身體比例
+  沒有被扭曲；而 90% 的框長寬比落在 [0.8, 1.25] 之外，直接拉伸會把「趴著／站立」這條
+  最強的線索抹平。順帶也解決 nvinfer 的 16 px 輸入下限。
+- **nvinfer 內建的 classifier parser 會對輸出取 argmax 且不套 sigmoid**，會把三個 logit
+  折成一個互斥標籤，違背「三項獨立機率」。要用 `output-tensor-meta=1` 自己算 sigmoid。
+- ONNX 要 export dynamic batch（一次 batch 20–30 個 crop，而不是逐一呼叫）。
 
-## 私人 Google Drive 憑證
+## 專案結構
 
-- 不把 OAuth token 貼進 UI，也不放在一般 `.env`。
-- 預留的本機位置是 `var/secrets/rclone.conf`；`var/` 與 `rclone.conf` 都在 `.gitignore`，目錄權限為 `700`。
-- `gitignore` 只防止誤提交，不等於加密。接上 rclone 時仍會啟用 config encryption；解密密碼不可與 config 放在同一檔案。
-- 目前尚未建立 token 或 rclone config，也沒有讀取任何 Google 帳號憑證。
-
-## 測試
-
-```bash
-pytest -q
+```text
+surftrack.py            啟動器
+surf_track/
+  server.py             stdlib HTTP server 與 /api/v1 路由
+  store.py              SQLite：datasets / images / annotations / jobs / training_runs
+                        （training_runs 以分享者為範圍，不綁單一 dataset）
+  ingest.py             下載影片、ffmpeg 抽影格的背景 worker
+  config.py             Settings（環境變數 SURF_TRACK_*）
+  drive/ facebook/      來源連結解析與下載
+  dataset/split.py      依來源影片分組的 80/10/10 切分
+  training/             action.py 訓練、manager.py 背景工作、stream.py 遠端 GPU
+  web/                  index.html / app.js / styles.css
+var/                    執行期資料（DB、影片、影格、模型、憑證）；不進 git
 ```
+
+## 憑證
+
+- 公開 Drive 走 `gdown`，不需要帳號或 API key。
+- 私人 Drive 預留 `var/secrets/rclone.conf` + `~/.config/surftrack/rclone-config.pass`，
+  目錄權限 700，尚未實際接上。
+- Facebook 只保留清除追蹤參數後的 canonical URL；密碼、cookie、token 不得寫入 UI、
+  設定檔、log 或 Dataset。
 
 ## 目前狀態
 
-- 已完成工程師極簡的 Data／Label／Train 單頁 UI；掃描後會直接指出下一步。
-- 已完成公開 Drive 掃描，以及 Facebook 貼文連結的安全接收與正規化。
-- 建立 Dataset 時必須填分享者／來源名稱，並保存來源平台、canonical URL、來源標題及影片數。
-- Label 支援拉框、W/E/R 多選狀態、點框重設、Delete 刪除與空白鍵保存下一張。
-- SQLite 會保存工作 checkpoint、Dataset、影格與標注；意外關機後執行中的工作會標為可恢復。
-- Train 頁面已定義 detector recall、mAP50、action macro F1、三類 F1 與 Orin Hz。
-- 尚未接上私人 Google Drive OAuth、Facebook 隔離登入、實際抽圖 worker 與模型訓練 worker。
+已完成：Drive 掃描與 ingest、標注 UI 與 SQLite checkpoint（意外關機的工作會標為可恢復）、
+動作模型訓練與預覽、遠端 GPU streaming 訓練。
 
-## 部分標注
+未完成：私人 Drive OAuth、Facebook 登入與影片下載、bbox detector 訓練與 Orin 部署。
 
-你可以只框一張圖裡的部分 surfer。這些框可以訓練三種動作分類；但圖片預設不會訓練 bbox detector，避免未框的 surfer 被誤當背景。只有在 Label 頁勾選「區域內所有 surfer 都已框完」後，該圖片才進入 detector dataset。
+規格見 [docs/spec.md](docs/spec.md)，開發約定見 [CLAUDE.md](CLAUDE.md)。
 
-標注定義見 [docs/labels.md](docs/labels.md)，資料原則見 [docs/data.md](docs/data.md)。
+## 致謝
+
+感謝以下提供影片用於模型訓練：
+
+- [黃偉豪](https://www.instagram.com/mybaby04094911/)
+- [布魯托衝浪攝影](https://www.instagram.com/brutalsurfcam/)

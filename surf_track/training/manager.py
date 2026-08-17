@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import random
 import threading
+from pathlib import Path
 
 from surf_track.store import StoreError, SurfTrackStore
+
+# One combined model trained across the selected sharers, not one model per dataset.
+ACTION_MODEL_PATH = Path("models") / "action" / "actions_mobilenet_v3_small.pt"
 
 
 class TrainingError(RuntimeError):
@@ -16,9 +20,9 @@ class TrainingManager:
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
 
-    def preview(self, dataset_id: str, *, limit: int = 25) -> dict[str, object]:
-        samples = self.store.list_action_samples(dataset_id)
-        model_path = self.store.data_dir / "models" / dataset_id / "actions_mobilenet_v3_small.pt"
+    def preview(self, *, limit: int = 25) -> dict[str, object]:
+        samples = self.store.list_action_samples()
+        model_path = self.store.data_dir / ACTION_MODEL_PATH
         if not model_path.is_file():
             raise TrainingError("尚未有可預覽的動作模型，請先完成 Train。")
 
@@ -89,18 +93,28 @@ class TrainingManager:
                 temporary.replace(destination)
         return str(destination)
 
-    def start(self, dataset_id: str, *, epochs: int = 8) -> dict[str, object]:
-        samples = self.store.list_action_samples(dataset_id)
-        if not samples:
-            raise TrainingError("尚未標注任何可訓練的人物框。")
+    def start(self, sharers: list[str], *, host: str, epochs: int = 24) -> dict[str, object]:
+        from surf_track.training.stream import StreamError, validate_host
+
+        if not sharers:
+            raise TrainingError("請至少勾選一位分享者的資料集。")
+        # Host first: it reaches ssh, and it is validated before the run row exists so a
+        # typo does not leave a failed run behind.
         try:
-            run = self.store.create_training_run(dataset_id, total_epochs=epochs)
+            target = validate_host(host)
+        except StreamError as exc:
+            raise TrainingError(str(exc)) from exc
+        samples = self.store.list_action_samples(sharers)
+        if not samples:
+            raise TrainingError("勾選的分享者還沒有任何已標注的人物框。")
+        try:
+            run = self.store.create_training_run(sharers, total_epochs=epochs)
         except StoreError as exc:
             raise TrainingError(str(exc)) from exc
         run_id = str(run["id"])
         thread = threading.Thread(
             target=self._run,
-            args=(run_id, dataset_id, epochs, samples),
+            args=(run_id, epochs, samples, target),
             name=f"surftrack-train-{run_id}",
             daemon=True,
         )
@@ -109,18 +123,32 @@ class TrainingManager:
         thread.start()
         return run
 
-    def _run(self, run_id: str, dataset_id: str, epochs: int, samples: list[dict[str, object]]) -> None:
-        metrics: dict[str, object] = {"stage": "載入預訓練小模型"}
+    def _run(
+        self,
+        run_id: str,
+        epochs: int,
+        samples: list[dict[str, object]],
+        host: str,
+    ) -> None:
+        metrics: dict[str, object] = {"stage": f"連線遠端 GPU 主機 {host}"}
         self.store.update_training_run(run_id, state="running", epoch=0, metrics=metrics)
         try:
-            from surf_track.training.action import train_action_model
+            # Training only ever runs on the remote GPU host; frames stay on this machine.
+            from surf_track.training.stream import feed
 
-            output_path = self.store.data_dir / "models" / dataset_id / "actions_mobilenet_v3_small.pt"
+            output_path = self.store.data_dir / ACTION_MODEL_PATH
 
             def on_epoch(epoch: int, current: dict[str, float]) -> None:
                 self.store.update_training_run(run_id, state="running", epoch=epoch, metrics=current)
 
-            final_metrics = train_action_model(samples, output_path, epochs=epochs, on_epoch=on_epoch)
+            final_metrics = feed(
+                samples,
+                output_path,
+                host=host,
+                epochs=epochs,
+                on_epoch=on_epoch,
+                cache_dir=self.store.data_dir / "cache" / "crops",
+            )
             final_metrics["model_path"] = str(output_path.relative_to(self.store.data_dir))
             final_metrics["detector_state"] = "waiting_for_complete_images"
             self.store.update_training_run(run_id, state="completed", epoch=epochs, metrics=final_metrics)
