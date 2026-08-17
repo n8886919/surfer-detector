@@ -48,47 +48,53 @@ python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@1
   折成一個互斥標籤，違背「三項獨立機率」。要用 `output-tensor-meta=1` 自己算 sigmoid。
 - ONNX 要 export dynamic batch（一次 batch 20–30 個 crop，而不是逐一呼叫）。
 
-### Detector（PGIE）：匯出必須截掉後處理
+### Detector（PGIE）
 
-torchvision 把分數過濾與 NMS 烘進 forward，匯出的圖會帶 `If` / `NonZero` / `TopK`，
-TensorRT 的靜態 engine 吃不下。**只匯出 `backbone` + `head`**，把 decode 與 NMS 留給
-DeepStream parser，圖就完全乾淨（八個候選實測皆如此）。訓練與本機評估仍用完整模型，
-Python 後處理沒有問題，所以要自己寫 decode 的地方只有 parser 一處。
+**匯出必須截掉後處理。** torchvision 把分數過濾與 NMS 烘進 forward，匯出的圖會帶
+`If` / `NonZero` / `TopK`，TensorRT 的靜態 engine 吃不下。只匯出 `backbone` + `head`，把
+decode 與 NMS 留給 DeepStream parser，圖就完全乾淨。訓練與本機評估仍用完整模型，Python
+後處理沒問題，所以要自己寫 decode 的地方只有 parser 一處。
 
 Faster R-CNN 系列不能用：`RoIAlign` 在網路中間而不是後處理，切不掉。
-
-640×640 單類、只含 backbone+head 的實測（`weights=None`，量的是圖與 MACs）：
-
-| 模型 | GMAC | 參數 | 匯出 |
-|---|---|---|---|
-| ssdlite320_mobilenet_v3_large | 1.6 | 2.2M | clean |
-| **mobilenet_v3_large_fpn + FCOS** | **6.6** | 9.2M | clean |
-| mobilenet_v3_large_fpn + RetinaNet | 6.7 | 9.3M | clean |
-| fcos_resnet50_fpn | 80.2 | 32.1M | clean |
-| retinanet_resnet50_fpn | 81.1 | 32.2M | clean |
-
-ResNet50-FPN 是**算力**出局而非匯出出局：80 GMAC 在 10 Hz 端到端預算下不可行。
-
-選 FCOS 而非 RetinaNet 的理由是 anchor-free —— RetinaNet 的 parser 必須把 anchor 尺寸、
+選 FCOS 而非 RetinaNet 是因為 anchor-free —— RetinaNet 的 parser 必須把 anchor 尺寸、
 比例、每層 stride 一模一樣複製一遍，錯了不會報錯，只會讓 mAP 莫名偏低。
 
-輸入解析度**不要用 640×640**。影格是 16:9（1168 張 1920×1080、442 張 3840×2160），letterbox
-進正方形會有 40% 的像素是灰邊，而框大小和 640×384 完全相同。同成本下該把像素花在解析度上：
+架構：`mobilenet_v3_large(norm_layer=FrozenBatchNorm2d)` 的 features，用公開的
+`BackboneWithFPN` 取 index [4, 7, 16]（stride 8 / 16 / 32、通道 [40, 80, 960]），FPN 128
+通道，`LastLevelP6P7` 補到 5 層，`FCOSHead(128, ..., num_convs=4)`。單類所以
+`num_classes=1`，sigmoid head 沒有背景通道，**ground-truth label 必須全是 0 而不是 1**。
+實測 0 個 live `BatchNorm2d` / 46 個 `FrozenBatchNorm2d` / 8 個 `GroupNorm`，所以 6GB 卡的
+小 batch 不會毀掉 BN 統計。匯出實測 1246 nodes / 19 ops，CLEAN。
 
-| 輸入 | GMAC | 中位框高 | 框高 < 32 px |
-|---|---|---|---|
-| 320×320 | — | 31 px | 851 / 1610（52.9%） |
-| 640×384 | 3.95 | 62 px | 213（13.2%） |
-| 640×640 | 6.58 | 62 px | 213（13.2%）← 多花 67% 算力換到 0 |
-| **864×480** | **6.72** | **83 px** | **84（5.2%）** |
-| 1024×576 | 9.48 | 100 px | 51（3.2%） |
-| 1280×736 | 15.19 | 125 px | 27（1.7%） |
+**三個會靜默壞掉的坑：**
 
-**864×480 是 640×640 的免費升級**（成本幾乎相同，框大 34%）。Orin 若有餘裕就用 1024×576。
+1. `_mobilenet_extractor` 的預設 `returned_layers` 最細 stride 是 **32**，整張圖只有
+   **540 個位置** —— 對中位數 87 px 的框毫無意義。必須明確指定 stride 8 起跳。
+2. torchvision 的 `min_size=800, max_size=1333` 預設會**放大**你的輸入（實測 576×1024 →
+   768×1344，算力多 2.3 倍且無提示）。必須明確傳 `min_size` / `max_size`。
+3. stride 是 `padded_dim // grid_dim`，**不是** 2 的次方。只有兩軸都能被 128 整除才乾淨：
+   1024×576 的 P7 是 stride_y=115（兩軸不等），1280×736 是 61 / 122。parser 會算錯。
+
+**算力在 head，不在 backbone**（實測 77%），所以槓桿是 FPN 通道與 head conv 數：
+896×512 下 fpn128/head2conv 9.16、fpn128/head4conv 14.79、fpn256/head4conv 52.98 GMAC。
+
+輸入定 **896×512**（stride 乾淨、追浪的框還撐得住）。影格是 16:9（1168 張 1920×1080、
+442 張 3840×2160），letterbox 進正方形會浪費 40% 像素在灰邊上且框大小完全不變：
+
+| 輸入 | GMAC | 位置數 | 中位框高 | < 32 px | **追浪**中位 | stride |
+|---|---|---|---|---|---|---|
+| 640×384 | 7.93 | 5115 | 62 px | 213（13.2%） | 31 px | 乾淨 |
+| **896×512** | **14.79** | **9548** | **87 px** | **77（4.8%）** | **43 px** | **乾淨** |
+| 1024×576 | 19.02 | 12280 | 100 px | 51（3.2%） | 50 px | ✗ P7 115 |
+| 1152×640 | ~23 | 15345 | 111 px | 34（2.1%） | 54 px | 乾淨 |
+
+`chasing_wave` 的框是三類中最小的（浪把人推向鏡頭，站起來才變大），而它正是必須先開火
+才能讓 tracker 建立 ID 的那一類 —— 所以解析度不是次要議題。640×384 下追浪只有 31 px。
+
 框高是把每張影格按 `min(W/iw, H/ih)` 縮放後量的；原始框高中位數 200 px。
 
 **上面沒有任何 ms 數字，因為還沒有在 Orin 上量過。** 要定案就在板子上跑
-`trtexec --fp16 --shapes=images:1x3x640x640`，不要拿別人的 benchmark 外推。
+`trtexec --fp16 --shapes=images:1x3x512x896`，不要拿別人的 benchmark 外推。
 
 ## 專案結構
 
