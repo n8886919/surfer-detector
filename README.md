@@ -50,10 +50,21 @@ python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@1
 
 ### Detector（PGIE）
 
-**匯出必須截掉後處理。** torchvision 把分數過濾與 NMS 烘進 forward，匯出的圖會帶
-`If` / `NonZero` / `TopK`，TensorRT 的靜態 engine 吃不下。只匯出 `backbone` + `head`，把
-decode 與 NMS 留給 DeepStream parser，圖就完全乾淨。訓練與本機評估仍用完整模型，Python
-後處理沒問題，所以要自己寫 decode 的地方只有 parser 一處。
+**匯出必須截掉後處理**，但理由**不是** TensorRT 吃不下 —— TensorRT 10.16 的 operator 表
+把 `NonMaxSuppression` / `NonZero` / `If` / `TopK` / `RoiAlign` 全列為支援。真正的理由有三個：
+
+1. **綁死的是 nvinfer 不是 TensorRT。** data-dependent shape 的輸出回報 `-1` 維度、要求呼叫端
+   註冊 `IOutputAllocator`，而 nvdsinfer 交給 custom parser 的是它自己依 init 時已知維度預先
+   配置好的 buffer。這兩個契約不相容。（**DS 9.1 上未經驗證**，NVIDIA 兩邊都沒明說。）
+2. **不管怎樣都要寫 custom C++ parser。** nvinfer 對任何「NMS 在圖內」的輸出格式都沒有內建
+   parser —— `nvdsinfer_yolo*_efficient_nms` 整個生態就是為此存在的。截掉後處理只要多寫
+   FCOS 的 decode（anchor-free，約 25 行），沒有多付任何代價。
+3. **DDS 會強迫同步執行**，直接打在 pipeline 的 10 Hz 預算上。
+
+**不要規劃 `EfficientNMS_TRT`**：它在 TensorRT 10.12 被 deprecated，`EfficientNMS_ONNX_TRT`
+在 **10.16 被移除**，官方替代是 `INMSLayer`。
+
+訓練與本機評估仍用完整模型，Python 後處理沒問題，所以要自己寫 decode 的地方只有 parser 一處。
 
 Faster R-CNN 系列不能用：`RoIAlign` 在網路中間而不是後處理，切不掉。
 選 FCOS 而非 RetinaNet 是因為 anchor-free —— RetinaNet 的 parser 必須把 anchor 尺寸、
@@ -92,6 +103,44 @@ Faster R-CNN 系列不能用：`RoIAlign` 在網路中間而不是後處理，�
 才能讓 tracker 建立 ID 的那一類 —— 所以解析度不是次要議題。640×384 下追浪只有 31 px。
 
 框高是把每張影格按 `min(W/iw, H/ih)` 縮放後量的；原始框高中位數 200 px。
+
+### DeepStream 9.1 / JetPack 7.2.1 上會靜默壞掉的事
+
+版本：**DeepStream 9.1 對應 JetPack 7.2（L4T r39.2）**，TensorRT 10.16.2。DS 9.1 重建了所有
+engine，所以 engine、custom parser、plugin 都要對 DS 9.1 重編，**絕對不要沿用 JetPack 6.x 的**。
+
+**正規化的算術**（最容易無聲搞錯的一處）。nvinfer 的公式是
+`y = net-scale-factor × (x − offsets)`，`x` 是 **0–255 的整數**、`offsets` 也在 0–255 單位並
+在縮放**之前**相減。⚠️ NVIDIA 自家的 agent-skill 參考文件寫成 `(input × scale) − offsets` 且
+說 offsets 是「mean / std」—— 照那個寫會得到 ~2.1 而不是 ~123.7，**差 58 倍、不會報錯、看起來
+只像是「模型沒訓練好」**。以 plugin 手冊為準。
+
+而且 `net-scale-factor` 是**單一純量**，所以 ImageNet 的 per-channel std（0.229/0.224/0.225）
+**無法精確表示**。解法是把正規化烘進 ONNX（輸入端一個 Mul + Add，TensorRT 會把常數摺進第一層
+conv，零成本），nvinfer 設 `net-scale-factor: 1.0` / `offsets: 0;0;0`。四個容易寫反的數字變成
+一個開關。
+
+`model-color-format: 0`（RGB）—— torchvision 的 transform 吃 RGB PIL，設成 1 會 R/B 對調且
+不報錯。`offsets` 的順序跟著網路的 channel 順序，RGB 就是 `123.675;116.280;103.530`，不是你
+從大多數範例 config 抄來的 BGR 順序。
+
+**輸入幾何必須在訓練前決定。** torchvision 的 `GeneralizedRCNNTransform` 不會給你固定尺寸：
+`min_size=max_size=640` 會把 1920×1080 變成 640×360 再 pad 成 640×384，那沒辦法交給固定形狀的
+engine。選 896×512 的附帶好處是它的 aspect 1.75 對上來源 1.778 只差 1.6%，所以可以直接非等比
+squash、`maintain-aspect-ratio=0`，**完全不需要 letterbox 座標還原**（那是「框整體偏移 50 px」
+這類 bug 的長年來源）。SGIE 不受影響 —— nvinfer 是從 streammux 的全解析度 surface 裁切物件，
+不是從 PGIE 的張量。
+
+**`pyds` 已經 deprecated**，DS 9.0 起不再釋出 wheel，官方替代是 SDK 內附的 `pyservicemaker`。
+一個實務限制：probe **可以改寫** `obj.rect_params`（所以 1.55 倍正方形 padding 可行），但
+**無法刪除 object meta**（NVIDIA：「目前 pyservicemaker 沒有提供移除 object meta 的介面」）。
+
+其他容易踩的：`pre-cluster-threshold` / `nms-iou-threshold` / `topk` 放在 `class-attrs-all`
+而不是 `property`；ONNX 有任何 dynamic axis 就**必須**設 `infer-dims`；一定要設
+`model-engine-file`，否則每次啟動都重建 engine（Orin Nano 上要好幾分鐘）。
+
+**Orin Nano 沒有 DLA**，GPU 是唯一的推論引擎。DS 9.1 的官方效能頁只有 AGX Thor / AGX Orin /
+DGX Spark / dGPU，**Orin Nano 完全沒有已發表數字**。
 
 **上面沒有任何 ms 數字，因為還沒有在 Orin 上量過。** 要定案就在板子上跑
 `trtexec --fp16 --shapes=images:1x3x512x896`，不要拿別人的 benchmark 外推。
