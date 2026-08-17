@@ -32,8 +32,11 @@ class TrainingManager:
         """`seed` picks which sample of images to draw, so the UI can ask for another batch."""
         samples = self.store.list_action_samples()
         model_path = self.store.data_dir / ACTION_MODEL_PATH
+        detector_path = self.store.data_dir / DETECTOR_MODEL_PATH
         if not model_path.is_file():
             raise TrainingError("尚未有可預覽的動作模型，請先完成 Train。")
+        if not detector_path.is_file():
+            raise TrainingError("尚未有可預覽的 detector 模型，請先完成 Train。")
 
         grouped: dict[str, list[dict[str, object]]] = {}
         for sample in samples:
@@ -55,36 +58,15 @@ class TrainingManager:
 
         from surf_track.training.action import ACTION_NAMES, predict_action_samples
 
-        paths = [grouped[image_id][0]["path"] for image_id in selected_ids]
-        detector_path = self.store.data_dir / DETECTOR_MODEL_PATH
-        if detector_path.is_file():
-            # The deployed pipeline's own order: the detector finds the bodies, the action
-            # model reads each one. Human boxes would hide every miss the detector makes.
-            from surf_track.training.detector import predict_detector_images
-            from surf_track.training.stream import DETECTOR_SCORE_THRESHOLD
+        # The deployed pipeline's own order: the detector finds the bodies, the action model
+        # reads each one. Human boxes would hide every miss the detector makes.
+        from surf_track.training.detector import predict_detector_images
+        from surf_track.training.stream import DETECTOR_SCORE_THRESHOLD
 
-            boxes_per_image = predict_detector_images(
-                paths, detector_path, score_threshold=DETECTOR_SCORE_THRESHOLD,
-            )
-            mode = "detector_boxes_with_action_predictions"
-            message = (
-                f"框為 detector 辨識結果（{_trained_at(detector_path)} 訓練，"
-                f"信心 ≥ {DETECTOR_SCORE_THRESHOLD:.2f}）；"
-                f"框內數字為動作模型機率（{_trained_at(model_path)} 訓練）。"
-            )
-        else:
-            boxes_per_image = [
-                [
-                    {"x": box["x"], "y": box["y"], "width": box["width"], "height": box["height"]}
-                    for box in grouped[image_id]
-                ]
-                for image_id in selected_ids
-            ]
-            mode = "action_predictions_on_human_boxes"
-            message = (
-                "尚未有 detector 模型，框為人工標注；"
-                f"框內數字為動作模型機率（{_trained_at(model_path)} 訓練）。"
-            )
+        paths = [grouped[image_id][0]["path"] for image_id in selected_ids]
+        boxes_per_image = predict_detector_images(
+            paths, detector_path, score_threshold=DETECTOR_SCORE_THRESHOLD,
+        )
 
         # Flat and positional: a detected box has no annotation_id to key predictions by.
         crops = [
@@ -106,7 +88,15 @@ class TrainingManager:
                 ],
             })
             offset += len(boxes)
-        return {"mode": mode, "message": message, "images": images}
+        return {
+            "mode": "detector_boxes_with_action_predictions",
+            "message": (
+                f"框為 detector 辨識結果（{_trained_at(detector_path)} 訓練，"
+                f"信心 ≥ {DETECTOR_SCORE_THRESHOLD:.2f}）；"
+                f"框內數字為動作模型機率（{_trained_at(model_path)} 訓練）。"
+            ),
+            "images": images,
+        }
 
     def thumbnail_path(self, image_id: str) -> str:
         from PIL import Image, ImageOps
