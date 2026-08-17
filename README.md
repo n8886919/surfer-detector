@@ -75,7 +75,23 @@ Faster R-CNN 系列不能用：`RoIAlign` 在網路中間而不是後處理，�
 通道，`LastLevelP6P7` 補到 5 層，`FCOSHead(128, ..., num_convs=4)`。單類所以
 `num_classes=1`，sigmoid head 沒有背景通道，**ground-truth label 必須全是 0 而不是 1**。
 實測 0 個 live `BatchNorm2d` / 46 個 `FrozenBatchNorm2d` / 8 個 `GroupNorm`，所以 6GB 卡的
-小 batch 不會毀掉 BN 統計。匯出實測 1246 nodes / 19 ops，CLEAN。
+小 batch 不會毀掉 BN 統計。
+
+**detector 必須以固定 batch 1 匯出，絕對不要加 dynamic axis。** 實測加了之後三個輸出全部變成
+symbolic（`['Concat1790_dim_0', 'Concat1790_dim_1', 1]`）—— **9548 這個數字被摧毀**，而 nvinfer
+要求輸出 shape 全靜態。靜態版是 **1062 nodes / 18 op types**，輸出 `[1,9548,1]` / `[1,9548,4]`
+/ `[1,9548,1]`。動作分類器**相反**，它需要 dynamic batch（一次 20–30 個 crop）。
+
+**decode 要烘進 ONNX，parser 裡不留任何幾何。** custom C++ parser 無法避免（nvinfer 對
+`boxes`+`scores` 佈局沒有內建 parser），但把 FCOS 的 decode 放進圖裡，就能把 stride 表、FPN
+層序、clamp 邊界這三個無聲坑從 C++ 搬到 Python，用 pytest 斷言。已驗證：以常數 `centers` /
+`sizes` 算 `scores = sqrt(sigmoid(cls) × sigmoid(ctrness))`、`boxes = (cx − l·s, …)` 再 clamp，
+對 torchvision 的 `box_coder.decode` + `clip_boxes_to_image`，9548 個位置的 max abs diff
+**恰好 0.0**。烘進去後圖仍乾淨：1085 nodes / 23 op types、輸出全靜態。
+
+parser 於是只剩約 40 行：**按 `layerName` 查 layer（不要按 index）**、用
+`detectionParams.perClassPreclusterThreshold[0]` 過濾、把角點填進 `NvDsInferObjectDetectionInfo`
+（**逐欄位指名賦值，不要 positional brace-init** —— 該 struct 在 DS 9.1 的欄位數沒有可靠來源）。
 
 **三個會靜默壞掉的坑：**
 
@@ -138,6 +154,28 @@ squash、`maintain-aspect-ratio=0`，**完全不需要 letterbox 座標還原**�
 其他容易踩的：`pre-cluster-threshold` / `nms-iou-threshold` / `topk` 放在 `class-attrs-all`
 而不是 `property`；ONNX 有任何 dynamic axis 就**必須**設 `infer-dims`；一定要設
 `model-engine-file`，否則每次啟動都重建 engine（Orin Nano 上要好幾分鐘）。
+
+**最危險的一個未知：nvinfer 的 per-object classifier cache。** 如果 SGIE 的結果只在每個 track
+的**第一幀**出現，那麼一個在追浪階段第一次被看到的 track 會**一輩子回報追浪**，起乘的瞬間永遠
+不會被觀測到 —— 「選最早起乘的人」這個核心情境直接死亡，**而且每個框、每個 ID 看起來都完美**。
+上板第一件事就是這個 canary：300 幀內數「物件數」對「當幀取得新 tensor meta 的物件數」，穩態
+必須相等。`network-type=100` 應該能繞掉（cache 分支掛在 classifier instance 上）。
+
+**還有一個只能上板才知道的**：pyservicemaker 讀不讀得到掛在 object 上的 tensor meta
+（`obj_user_meta_list`）。讀不到的話 fallback 是在同一個 `.so` 裡多寫約 20 行 classifier
+parser，讓三個 sigmoid 以三個獨立的 `NvDsClassifierMeta` attribute 送出 —— 仍然是三項獨立
+機率、仍然沒有 argmax，只是換運輸方式。
+
+**detector 訓練好之前就能驗證整條 pipeline**：匯出一個 synthetic engine —— 把 cls/ctrness head
+最後一層 bias 設成 `logit(0.9)`、regression bias 設成 1.5，再乘一個只在 N 個位置為 1 的常數
+mask。得到每幀恰好 N 個框、位置已知的確定性假 detector，跑的是真 config、真 parser、真 engine，
+所以 tracker + SGIE + probe 全部驗得到。**random-init 沒用**：`bbox_regression` 過 relu 後幾乎
+全 0，框全退化，PGIE 一個物件都不會產生。檔名要帶 `_synthetic`，且不要從它讀延遲數字。
+
+**GO/NO-GO 判準**：`trtexec` 量出 detector 單獨 **> 55 ms 就是 896×512 不成立**（100 ms 裡還要
+塞 decode、NvDCF 20 目標、24-crop SGIE、兩個 probe，而且要跟 DeepStream 共用板子）。替代方案
+README 已標好價：head 2conv 9.16 GMAC、640×384 7.93 GMAC —— 640×384 最後才用，它把追浪的中位
+框從 43 px 壓到 31 px。
 
 **Orin Nano 沒有 DLA**，GPU 是唯一的推論引擎。DS 9.1 的官方效能頁只有 AGX Thor / AGX Orin /
 DGX Spark / dGPU，**Orin Nano 完全沒有已發表數字**。

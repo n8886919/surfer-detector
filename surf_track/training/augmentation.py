@@ -7,6 +7,7 @@ import random
 import torch
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import v2
 
 
 class RandomJpegCompression:
@@ -109,19 +110,47 @@ def action_transform(*, training: bool, image_size: int = 160, degrade_to: int |
     ])
 
 
-DETECTOR_AUGMENTATION = {
-    "hsv_h": 0.025,
-    "hsv_s": 0.55,
-    "hsv_v": 0.45,
-    "degrees": 12.0,
-    "translate": 0.15,
-    "scale": 0.65,
-    "shear": 4.0,
-    "perspective": 0.0008,
-    "flipud": 0.0,
-    "fliplr": 0.5,
-    "mosaic": 0.8,
-    "mixup": 0.08,
-    "cutmix": 0.05,
-    "close_mosaic": 5,
-}
+def detector_transform(*, training: bool):
+    """Box-aware whole-frame augmentation for the detector, on `transforms.v2`.
+
+    `SanitizeBoundingBoxes` is not hygiene, it is mandatory: every geometric step clamps
+    boxes to the canvas, a clamped box can come out with zero width, and FCOS asserts on
+    that inside the loss. It runs in the eval pipeline too, because a hand-drawn box of zero
+    height would break evaluation the same way.
+
+    Scale jitter has to change box size *relative to the canvas*. The detector's own
+    `GeneralizedRCNNTransform` rescales every frame to 896x512, so anything that resizes the
+    whole frame (`ScaleJitter`, `RandomShortestSize`) is undone before the backbone sees it —
+    only zoom-out padding and affine scaling survive. That axis matters more than the rest
+    here: the camera zooms out to survey the wave and in to film the ride, so the same surfer
+    arrives at very different pixel sizes.
+
+    Translation stays small on purpose. A surfer shifted half out of frame keeps recognisable
+    pixels while their box gets clamped to a sliver, which teaches exactly the false negative
+    the tracker cannot afford.
+    """
+    if not training:
+        return v2.Compose([
+            v2.ToImage(),
+            v2.SanitizeBoundingBoxes(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.ToPureTensor(),
+        ])
+
+    return v2.Compose([
+        v2.ToImage(),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomZoomOut(fill=0, side_range=(1.0, 1.7), p=0.3),
+        v2.RandomAffine(degrees=5, translate=(0.04, 0.04), scale=(0.85, 1.15)),
+        v2.RandomPhotometricDistort(p=0.5),
+        v2.RandomGrayscale(p=0.05),
+        v2.RandomApply([v2.GaussianBlur(kernel_size=5, sigma=(0.2, 1.5))], p=0.15),
+        # Last of the pixel steps, so the 8x8 blocks land on the grid the model actually
+        # sees rather than on a grid a later resize would smear.
+        v2.JPEG(quality=(45, 95)),
+        v2.SanitizeBoundingBoxes(),
+        # Detection models want float [0, 1] and normalise internally; pure tensors keep the
+        # tv_tensor subclasses out of the model's own transform.
+        v2.ToDtype(torch.float32, scale=True),
+        v2.ToPureTensor(),
+    ])

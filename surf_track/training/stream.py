@@ -1,20 +1,23 @@
-"""Train the action model on a remote CUDA host without copying the dataset there.
+"""Train the action or detector model on a remote CUDA host without copying the dataset.
 
-Frames stay on this machine. The feeder crops each annotation locally, streams only
-the crops for the batches currently in flight over one SSH pipe, and the remote worker
-keeps them in memory, trains on the GPU, and streams the checkpoint back. The remote
-host never writes dataset bytes to disk.
+Frames stay on this machine. The feeder prepares the pixels locally — padded crops for the
+action model, downscaled whole frames for the detector — streams only what the batches
+currently in flight need over one SSH pipe, and the remote worker keeps them in memory,
+trains on the GPU, and streams the checkpoint back. The remote host never writes dataset
+bytes to disk.
 
     # on this machine
     python -m surf_track.training.stream feed --sharer surfrec.tw --host nolan@192.168.31.128
+    python -m surf_track.training.stream feed-detector --host nolan@192.168.31.128
 
-    # started by the feeder over ssh, not by hand
+    # started by the feeder over ssh, not by hand; the config message picks the task
     python -m surf_track.training.stream serve
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import re
 import struct
@@ -28,7 +31,22 @@ IMAGE_SIZE = 160
 LOWRES_EVAL_SIDE = 64
 VALID_BATCH_SIZE = 32
 CROP_QUALITY = 95
+FRAME_QUALITY = 90
 DEFAULT_REMOTE_ROOT = "~/surf-track"
+
+# Detector recipe. 896x512 frames need a smaller batch than 160 px crops do on a 6GB card,
+# and more epochs because each one sees ~1200 frames instead of ~1400 crops.
+DETECTOR_BATCH_SIZE = 8
+DETECTOR_EPOCHS = 30
+DETECTOR_TRAINABLE_STAGES = 2
+# The head starts from random weights against a pretrained backbone, so it trains alone
+# first; unfreezing immediately lets its early gradients drag the features around.
+DETECTOR_HEAD_ONLY_EPOCHS = 2
+DETECTOR_LEARNING_RATE = 2e-4
+DETECTOR_WARMUP_STEPS = 250
+# The confidence the deployed pipeline would run at: recall and FP/frame are reported there,
+# while mAP50 stays threshold-free and picks the checkpoint.
+DETECTOR_SCORE_THRESHOLD = 0.5
 _FRAME = struct.Struct(">II")
 # The host is passed straight to ssh, which has no "--" terminator: a value starting with
 # "-" would be read as an option (e.g. -oProxyCommand=...) and run commands locally.
@@ -127,6 +145,59 @@ class CropCache:
         return blob
 
 
+class FrameCache:
+    """Whole frames downscaled once to the detector's input box, then reused every epoch.
+
+    The dataset is 1080p and 4K JPEG. Decoding it at full size costs ~36 s per epoch on this
+    machine against a GPU step well under a second, and every epoch would pay it again;
+    after the first epoch the feeder here only reads bytes. `draft` does the downscale inside
+    the JPEG decoder — a 3840x2160 frame is decoded straight to 960x540, which is where most
+    of that time goes.
+
+    Pixels only. Boxes are re-read from SQLite every epoch, so editing a label never needs
+    the cache invalidated. `var/cache/thumbnails` is not reusable for this: it is preview-
+    owned, q82, and exif-transposed.
+
+    The input box is passed in rather than defaulted, because reading it from `detector.py`
+    would put a torch import at this module's top level, and `manager.py` imports this module
+    from the server.
+    """
+
+    def __init__(self, directory: Path, width: int, height: int):
+        self.directory = directory
+        self.width = width
+        self.height = height
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.built = 0
+        self.reused = 0
+
+    def frame_bytes(self, image: dict[str, object]) -> bytes:
+        destination = self.directory / f"{image['image_id']}_{self.width}x{self.height}.jpg"
+        if destination.is_file():
+            self.reused += 1
+            return destination.read_bytes()
+
+        from PIL import Image
+
+        with Image.open(Path(str(image["path"]))) as source:
+            # Must come before any pixel access; it only shrinks by 1/2, 1/4 or 1/8, so
+            # thumbnail still does the last, exact step.
+            source.draft("RGB", (self.width, self.height))
+            frame = source.convert("RGB")
+            # Aspect ratio is preserved — the model letterboxes, and the worker scales the
+            # normalised boxes against whatever size it decodes. Six frames in the dataset
+            # are 480x540, so this cannot assume 16:9.
+            frame.thumbnail((self.width, self.height))
+        buffer = BytesIO()
+        frame.save(buffer, format="JPEG", quality=FRAME_QUALITY)
+        blob = buffer.getvalue()
+        temporary = destination.with_suffix(".tmp")
+        temporary.write_bytes(blob)
+        temporary.replace(destination)
+        self.built += 1
+        return blob
+
+
 class _WorkerLink:
     """Owns the ssh subprocess and the reader thread draining its replies."""
 
@@ -215,6 +286,35 @@ def _batches(items: list, size: int):
         yield items[start:start + size]
 
 
+def _start_worker(target: str, remote_root: str, prefetch: int, ack_timeout: float, on_epoch):
+    """Bring the remote worker up, or fail loudly if it never reports ready."""
+    link = _WorkerLink(target, remote_root, prefetch, ack_timeout, on_epoch)
+    link.ready.wait(timeout=300)
+    if link.failure or link.closed.is_set():
+        raise StreamError(link.failure or f"連不上遠端 GPU 主機 {target}，請確認 ssh 金鑰與主機位址。")
+    return link
+
+
+def _collect_checkpoint(link: _WorkerLink, output_path: Path) -> dict[str, object]:
+    """Close the pipe, wait for the worker, and write the returned checkpoint atomically."""
+    link.send({"type": "finish"})
+    link.finish()
+
+    if link.failure:
+        raise StreamError(link.failure)
+    if not link.checkpoint:
+        raise StreamError("遠端沒有回傳 checkpoint。")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(".tmp")
+    temporary.write_bytes(link.checkpoint)
+    temporary.replace(output_path)
+
+    metrics = dict(link.final_metrics or {})
+    metrics["remote_gpu"] = link.gpu
+    return metrics
+
+
 def feed(
     samples: list[dict[str, object]],
     output_path: Path,
@@ -246,10 +346,7 @@ def feed(
     pos_weight = [min((len(grouped["train"]) - p) / max(p, 1), 12.0) for p in positives]
 
     cache = CropCache(cache_dir)
-    link = _WorkerLink(target, remote_root, prefetch, ack_timeout, on_epoch)
-    link.ready.wait(timeout=300)
-    if link.failure or link.closed.is_set():
-        raise StreamError(link.failure or f"連不上遠端 GPU 主機 {target}，請確認 ssh 金鑰與主機位址。")
+    link = _start_worker(target, remote_root, prefetch, ack_timeout, on_epoch)
     on_epoch(0, {
         "stage": f"已連上遠端 GPU {link.gpu}",
         "train_boxes": float(len(grouped["train"])),
@@ -290,23 +387,92 @@ def feed(
             }, payload)
         link.send({"type": "epoch_end", "epoch": epoch})
 
-    link.send({"type": "finish"})
-    link.finish()
-
-    if link.failure:
-        raise StreamError(link.failure)
-    if not link.checkpoint:
-        raise StreamError("遠端沒有回傳 checkpoint。")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.with_suffix(".tmp")
-    temporary.write_bytes(link.checkpoint)
-    temporary.replace(output_path)
-
-    metrics = dict(link.final_metrics or {})
-    metrics["remote_gpu"] = link.gpu
+    metrics = _collect_checkpoint(link, output_path)
     metrics["streamed_mb"] = round(sent_bytes / 1e6, 1)
     metrics["crops_built"] = float(cache.built)
+    return metrics
+
+
+def feed_detector(
+    images: list[dict[str, object]],
+    output_path: Path,
+    *,
+    host: str,
+    epochs: int,
+    on_epoch,
+    cache_dir: Path,
+    remote_root: str = DEFAULT_REMOTE_ROOT,
+    batch_size: int = DETECTOR_BATCH_SIZE,
+    prefetch: int = 4,
+    ack_timeout: float = 300.0,
+    seed: int = 42,
+) -> dict[str, object]:
+    """Train the surfer detector on `host`'s GPU from locally downscaled frames.
+
+    `images` is `store.list_detector_images()` output: one entry per frame with its boxes
+    nested. The unit of work is the frame, not the box — a frame carries all of its boxes or
+    none of them, because everything in it that is not boxed is trained as background.
+    """
+    target = validate_host(host)
+    # Local because detector.py imports torch, and this module is reachable from the server.
+    from surf_track.training.detector import INPUT_HEIGHT, INPUT_WIDTH
+
+    grouped = {split: [i for i in images if i["split"] == split] for split in ("train", "valid", "test")}
+    # Frames, not boxes: batches are frames, and a 12-box single frame is not a dataset.
+    if len(grouped["train"]) < 12 or len(grouped["valid"]) < 3:
+        raise StreamError("至少需要 12 張 train 影格和 3 張 valid 影格才能開始 detector 訓練。")
+
+    cache = FrameCache(cache_dir, INPUT_WIDTH, INPUT_HEIGHT)
+    link = _start_worker(target, remote_root, prefetch, ack_timeout, on_epoch)
+    on_epoch(0, {
+        "stage": f"已連上遠端 GPU {link.gpu}",
+        "train_images": float(len(grouped["train"])),
+        "valid_images": float(len(grouped["valid"])),
+    })
+
+    shuffler = random.Random(seed)
+    sent_bytes = 0
+    link.send({
+        "type": "config",
+        "task": "detector",
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "train_images": len(grouped["train"]),
+        "valid_images": len(grouped["valid"]),
+        "score_threshold": DETECTOR_SCORE_THRESHOLD,
+        "seed": seed,
+    })
+
+    for epoch in range(1, epochs + 1):
+        order = list(range(len(grouped["train"])))
+        shuffler.shuffle(order)
+        planned = [
+            ("train", [grouped["train"][index] for index in chunk])
+            for chunk in _batches(order, batch_size)
+        ]
+        # Valid reuses batch_size: a 32-frame eval batch at 896x512 is what runs the 6GB
+        # card out of memory, and unlike the action model there is nothing to gain from it.
+        planned += [("valid", chunk) for chunk in _batches(grouped["valid"], batch_size)]
+        for split, chunk in planned:
+            blobs = [cache.frame_bytes(image) for image in chunk]
+            payload = b"".join(blobs)
+            sent_bytes += len(payload)
+            link.reserve_slot()
+            link.send({
+                "type": "batch",
+                "epoch": epoch,
+                "split": split,
+                "sizes": [len(blob) for blob in blobs],
+                # Ragged: one list of normalised xywh per frame. The fixed-width labels the
+                # action path sends cannot express this, which is why the worker decodes it
+                # through a separate path.
+                "boxes": [image["boxes"] for image in chunk],
+            }, payload)
+        link.send({"type": "epoch_end", "epoch": epoch})
+
+    metrics = _collect_checkpoint(link, output_path)
+    metrics["streamed_mb"] = round(sent_bytes / 1e6, 1)
+    metrics["frames_built"] = float(cache.built)
     return metrics
 
 
@@ -358,6 +524,63 @@ def _feed_cli(args: argparse.Namespace) -> int:
     print(f"streamed         {metrics['streamed_mb']} MB over {args.epochs} epochs")
     print(f"checkpoint       {output_path}")
     print(f"best macro F1    {metrics['action_macro_f1']:.3f}")
+    return 0
+
+
+def _feed_detector_cli(args: argparse.Namespace) -> int:
+    from surf_track.store import SurfTrackStore
+    from surf_track.training.manager import DETECTOR_MODEL_PATH
+
+    store = SurfTrackStore(Path(args.data_dir))
+    images = store.list_detector_images(args.sharer)
+    if not images:
+        print("勾選的分享者還沒有任何整張標注完成的影格。", file=sys.stderr)
+        return 1
+
+    def on_epoch(epoch: int, metrics: dict[str, object]) -> None:
+        if "detector_map50" not in metrics:
+            print(f"  {metrics.get('stage', '')}", flush=True)
+            return
+        print(
+            f"  epoch {epoch}/{args.epochs}"
+            f"  loss={metrics['train_loss']:.4f}"
+            f"  mAP50={metrics['detector_map50']:.3f}"
+            f"  recall={metrics['detector_recall']:.3f}"
+            f"  fp/frame={metrics['detector_fp_per_image']:.2f}"
+            f"  small={metrics['detector_small_recall']:.3f}",
+            flush=True,
+        )
+
+    output_path = store.data_dir / DETECTOR_MODEL_PATH
+    try:
+        metrics = feed_detector(
+            images,
+            output_path,
+            host=args.host,
+            epochs=args.epochs,
+            on_epoch=on_epoch,
+            cache_dir=store.data_dir / "cache" / "frames",
+            remote_root=args.remote_root,
+            batch_size=args.batch_size,
+            prefetch=args.prefetch,
+            ack_timeout=args.ack_timeout,
+            seed=args.seed,
+        )
+    except StreamError as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
+        return 1
+
+    print()
+    print(f"streamed         {metrics['streamed_mb']} MB over {args.epochs} epochs")
+    print(f"checkpoint       {output_path}")
+    print(f"best mAP50       {metrics['detector_map50']:.3f}")
+    print(
+        f"at score {metrics['detector_score_threshold']:.2f}"
+        f"    recall {metrics['detector_recall']:.3f}"
+        f"  ({metrics['detector_fp_per_image']:.2f} FP/frame,"
+        f" small-box recall {metrics['detector_small_recall']:.3f}"
+        f" over {int(metrics['detector_small_boxes'])} boxes)"
+    )
     return 0
 
 
