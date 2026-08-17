@@ -14,7 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["pillow>=10,<13", "torch>=2.4,<3", "torchvision>=0.19,<1"]
+# 0.20 for transforms.v2's JPEG; the detector augmentation needs it.
+train = ["pillow>=10,<13", "torch>=2.4,<3", "torchvision>=0.20,<1"]
 
 # Without this, setuptools' flat-layout discovery also picks up the runtime `var/`
 # directory and refuses to build.

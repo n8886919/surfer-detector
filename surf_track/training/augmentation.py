@@ -113,10 +113,12 @@ def action_transform(*, training: bool, image_size: int = 160, degrade_to: int |
 def detector_transform(*, training: bool):
     """Box-aware whole-frame augmentation for the detector, on `transforms.v2`.
 
-    `SanitizeBoundingBoxes` is not hygiene, it is mandatory: every geometric step clamps
-    boxes to the canvas, a clamped box can come out with zero width, and FCOS asserts on
-    that inside the loss. It runs in the eval pipeline too, because a hand-drawn box of zero
-    height would break evaluation the same way.
+    `SanitizeBoundingBoxes` is not hygiene, it is mandatory, and it has to run twice. At the
+    end because every geometric step clamps boxes to the canvas and a clamped box can come
+    out with zero width, which makes FCOS assert inside the loss. At the start because a
+    rotation turns a zero-height hand-drawn box into a *valid-looking* one — a 93x0 box comes
+    out of a 5 degree rotation as 93x8 — so sanitising only at the end trains the model on a
+    box that was never drawn. The eval pipeline has no geometric step, so one pass does it.
 
     Scale jitter has to change box size *relative to the canvas*. The detector's own
     `GeneralizedRCNNTransform` rescales every frame to 896x512, so anything that resizes the
@@ -139,6 +141,8 @@ def detector_transform(*, training: bool):
 
     return v2.Compose([
         v2.ToImage(),
+        # Before the geometry, so a rotation cannot inflate a degenerate box into a target.
+        v2.SanitizeBoundingBoxes(),
         v2.RandomHorizontalFlip(p=0.5),
         v2.RandomZoomOut(fill=0, side_range=(1.0, 1.7), p=0.3),
         v2.RandomAffine(degrees=5, translate=(0.04, 0.04), scale=(0.85, 1.15)),

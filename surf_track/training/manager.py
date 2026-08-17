@@ -8,6 +8,7 @@ from surf_track.store import StoreError, SurfTrackStore
 
 # One combined model trained across the selected sharers, not one model per dataset.
 ACTION_MODEL_PATH = Path("models") / "action" / "actions_mobilenet_v3_small.pt"
+DETECTOR_MODEL_PATH = Path("models") / "detector" / "surfer_fcos_mobilenet_v3_large.pt"
 
 
 class TrainingError(RuntimeError):

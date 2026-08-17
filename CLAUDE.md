@@ -55,3 +55,13 @@ migration、concurrency／race condition、API 相容性、不可逆變更、核
 ## 回報
 
 完成後回報 Changed / Validation / Risks（只有存在才列），不附完整工作日誌，不重述已知背景。
+
+## Session 交接
+
+一個里程碑做完、或 context 開始長到會拖慢回應時，**主動說「這裡適合開新 session」**，不要
+等使用者問。使用者在新 session 只會打「繼續」，所以提醒之前必須先把 auto-memory 裡的
+current-state 這則更新到「只靠它就能接手」：分支狀態、剛完成什麼並驗證過什麼、下一步的具體
+檔案與函式、已經排除的選項、已經踩過的坑。
+
+新 session 開場先讀 current-state，再用 git 與實際檔案驗證它（使用者持續在標資料，數字會變），
+不要把 memory 當成事實直接引用。

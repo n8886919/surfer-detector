@@ -599,15 +599,217 @@ def _decode_batch(payload: bytes, sizes: list[int], labels: list[list[int]], tra
     return torch.stack(tensors), torch.tensor(labels, dtype=torch.float32)
 
 
+def _decode_detector_batch(
+    payload: bytes,
+    sizes: list[int],
+    boxes: list[list[list[float]]],
+    transform,
+):
+    """Frames and ragged targets, as lists — a detector batch cannot be stacked.
+
+    `_decode_batch` ends in `torch.tensor(labels)`, which needs every row the same length;
+    one frame here has three boxes and the next has none left after augmentation. The wire
+    carries normalised boxes, so nothing has to agree with the feeder about what size the
+    cached frame decoded to.
+    """
+    import torch
+    from PIL import Image
+    from torchvision import tv_tensors
+
+    from surf_track.training.detector import SURFER_LABEL
+
+    frames: list[object] = []
+    targets: list[dict[str, object]] = []
+    offset = 0
+    for size, normalized in zip(sizes, boxes):
+        with Image.open(BytesIO(payload[offset:offset + size])) as source:
+            frame = source.convert("RGB")
+        offset += size
+        width, height = frame.size
+        absolute = torch.tensor(
+            [[x * width, y * height, (x + w) * width, (y + h) * height]
+             for x, y, w, h in normalized],
+            dtype=torch.float32,
+        ).reshape(-1, 4)
+        target = {
+            # BoundingBoxes is what makes the v2 transforms move the boxes with the pixels.
+            "boxes": tv_tensors.BoundingBoxes(absolute, format="XYXY", canvas_size=(height, width)),
+            # Single class, and FCOS uses the label as a channel index, so every box is 0.
+            "labels": torch.full((len(absolute),), SURFER_LABEL, dtype=torch.int64),
+        }
+        frame, target = transform(frame, target)
+        frames.append(frame)
+        targets.append(target)
+    return frames, targets
+
+
+def _train_detector(config: dict[str, object], stdin, stdout, device) -> int:
+    """Detector worker body, sharing `serve`'s prologue and its error reporting.
+
+    Separate from the action loop rather than folded into it: the targets are ragged, the
+    metrics are different, and the freeze schedule has two phases.
+    """
+    import torch
+
+    from surf_track.training.augmentation import detector_transform
+    from surf_track.training.detector import (
+        INPUT_HEIGHT, INPUT_WIDTH, build_detector, evaluate,
+    )
+
+    epochs = int(config["epochs"])
+    train_images = int(config["train_images"])
+    valid_images = int(config["valid_images"])
+    batch_size = max(1, int(config["batch_size"]))
+    score_threshold = float(config["score_threshold"])
+    _log(f"[worker] detector: {epochs} epochs, {train_images} train frames, batch {batch_size}")
+
+    torch.manual_seed(int(config["seed"]))
+    model = build_detector(trainable_stages=DETECTOR_TRAINABLE_STAGES).to(device)
+    # Captured before the freeze so a single optimizer covers both phases: AdamW skips any
+    # parameter whose grad is None, so the backbone simply does not move until it is thawed.
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    thawing = [p for p in model.backbone.body.parameters() if p.requires_grad]
+    for parameter in thawing:
+        parameter.requires_grad_(False)
+    optimizer = torch.optim.AdamW(parameters, lr=DETECTOR_LEARNING_RATE, weight_decay=1e-4)
+
+    steps_per_epoch = max(1, math.ceil(train_images / batch_size))
+    total_steps = max(DETECTOR_WARMUP_STEPS + 1, epochs * steps_per_epoch)
+
+    def learning_rate_scale(step: int) -> float:
+        """Warmup, then cosine down to 5%: FCOS's regression loss spikes on the first steps."""
+        if step < DETECTOR_WARMUP_STEPS:
+            return (step + 1) / DETECTOR_WARMUP_STEPS
+        progress = (step - DETECTOR_WARMUP_STEPS) / (total_steps - DETECTOR_WARMUP_STEPS)
+        return 0.05 + 0.95 * (1 + math.cos(math.pi * min(1.0, progress))) / 2
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_scale)
+    # fp16 is what makes 896x512 at batch 8 fit on a 6GB card; only the loss is scaled.
+    scaler = torch.amp.GradScaler("cuda")
+    train_transform = detector_transform(training=True)
+    valid_transform = detector_transform(training=False)
+
+    best_score = -1.0
+    best_state: dict[str, object] | None = None
+    best_metrics: dict[str, float] = {}
+    loss_totals: dict[str, float] = {}
+    predictions: list[dict[str, object]] = []
+    truths: list[dict[str, object]] = []
+
+    _log("[worker] detector ready, waiting for frames")
+    while True:
+        message = receive_message(stdin)
+        if message is None:
+            _log("[worker] stdin closed")
+            break
+        header, payload = message
+        kind = header.get("type")
+
+        if kind == "batch":
+            training = header["split"] == "train"
+            frames, targets = _decode_detector_batch(
+                payload, header["sizes"], header["boxes"],
+                train_transform if training else valid_transform,
+            )
+            batch = [frame.to(device, non_blocking=True) for frame in frames]
+            if training:
+                model.train()
+                on_device = [
+                    {name: value.to(device, non_blocking=True) for name, value in target.items()}
+                    for target in targets
+                ]
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    losses = model(batch, on_device)
+                    total = sum(losses.values())
+                scaler.scale(total).backward()
+                scaler.unscale_(optimizer)
+                # One bad early batch would otherwise take the whole run with it.
+                torch.nn.utils.clip_grad_norm_(parameters, 10.0)
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                for name, value in (("train_loss", total), *(
+                    (f"loss_{key}", item) for key, item in losses.items()
+                )):
+                    scalar = float(value.detach())
+                    # fp16 overflows to inf now and then; the scaler already discards that
+                    # step's update, and a bare Infinity in metrics_json would break
+                    # JSON.parse on the Train page.
+                    if math.isfinite(scalar):
+                        loss_totals[name] = loss_totals.get(name, 0.0) + scalar * len(frames)
+            else:
+                model.eval()
+                # no_grad rather than inference_mode: the metrics write in place into tensors
+                # derived from these boxes, which inference tensors forbid. And fp32 on the
+                # CPU, because box_iou cannot mix a CPU mask with CUDA boxes and fp16
+                # quantises a coordinate to half a pixel at 896.
+                with torch.no_grad():
+                    detections = model(batch)
+                predictions.extend(
+                    {"boxes": found["boxes"].float().cpu(), "scores": found["scores"].float().cpu()}
+                    for found in detections
+                )
+                truths.extend({"boxes": target["boxes"].float().cpu()} for target in targets)
+            send_message(stdout, {"type": "ack"})
+
+        elif kind == "epoch_end":
+            epoch = int(header["epoch"])
+            metrics = {
+                **{name: value / max(1, train_images) for name, value in loss_totals.items()},
+                **evaluate(predictions, truths, score_threshold=score_threshold),
+                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "train_images": float(train_images),
+                "valid_images": float(valid_images),
+            }
+            # mAP50 selects: recall alone would crown the epoch that fires on every wave.
+            if metrics["detector_map50"] >= best_score:
+                best_score = metrics["detector_map50"]
+                best_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in model.state_dict().items()
+                }
+                best_metrics = dict(metrics)
+            send_message(stdout, {
+                "type": "metrics", "epoch": epoch, "epochs": epochs, "metrics": metrics,
+            })
+            if epoch == DETECTOR_HEAD_ONLY_EPOCHS and thawing:
+                for parameter in thawing:
+                    parameter.requires_grad_(True)
+                _log(f"[worker] head settled; thawing {DETECTOR_TRAINABLE_STAGES} backbone stages")
+            loss_totals.clear()
+            predictions.clear()
+            truths.clear()
+
+        elif kind == "finish":
+            break
+
+    if best_state is None:
+        send_message(stdout, {"type": "error", "message": "沒有完成任何 epoch。"})
+        return 1
+
+    buffer = BytesIO()
+    torch.save({
+        "model": best_state,
+        "architecture": "fcos_mobilenet_v3_large_fpn",
+        "classes": ["surfer"],
+        # The ONNX export has to rebuild the same graph before loading this.
+        "trainable_stages": DETECTOR_TRAINABLE_STAGES,
+        "input_width": INPUT_WIDTH,
+        "input_height": INPUT_HEIGHT,
+        "metrics": best_metrics,
+        "trained_on": torch.cuda.get_device_name(0),
+    }, buffer)
+    send_message(stdout, {"type": "checkpoint", "metrics": best_metrics}, buffer.getvalue())
+    return 0
+
+
 def serve() -> int:
     stdout = sys.stdout.buffer
     try:
         import torch
         from torch import nn
         from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
-
-        from surf_track.training.action import ACTION_NAMES, f1_scores, macro_f1
-        from surf_track.training.augmentation import action_transform
 
         if not torch.cuda.is_available():
             send_message(stdout, {"type": "error", "message": "遠端沒有可用的 CUDA GPU；這個 worker 不支援 CPU 訓練。"})
@@ -622,6 +824,14 @@ def serve() -> int:
             send_message(stdout, {"type": "error", "message": "沒有收到 config。"})
             return 1
         config = first[0]
+        # The task arrives in the config, not on the command line, so the ssh command the
+        # feeder runs stays the same for both models.
+        if config.get("task") == "detector":
+            return _train_detector(config, stdin, stdout, device)
+
+        from surf_track.training.action import ACTION_NAMES, f1_scores, macro_f1
+        from surf_track.training.augmentation import action_transform
+
         _log(f"[worker] config: {config['epochs']} epochs, {config['train_boxes']} train boxes")
         epochs = int(config["epochs"])
         train_boxes = int(config["train_boxes"])
@@ -770,23 +980,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    feeder = subparsers.add_parser("feed", help="stream local crops to a remote CUDA host")
-    feeder.add_argument("--sharer", action="append", metavar="NAME", default=None,
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--sharer", action="append", metavar="NAME", default=None,
                         help="repeat per sharer; omit to train on every annotated dataset")
-    feeder.add_argument("--host", required=True, help="ssh target, e.g. nolan@192.168.31.128")
-    feeder.add_argument("--remote-root", default=DEFAULT_REMOTE_ROOT)
-    feeder.add_argument("--epochs", type=int, default=24)
-    feeder.add_argument("--batch-size", type=int, default=16)
-    feeder.add_argument("--prefetch", type=int, default=4, help="batches allowed in flight")
-    feeder.add_argument("--ack-timeout", type=float, default=300.0,
+    common.add_argument("--host", required=True, help="ssh target, e.g. nolan@192.168.31.128")
+    common.add_argument("--remote-root", default=DEFAULT_REMOTE_ROOT)
+    common.add_argument("--epochs", type=int, default=24)
+    common.add_argument("--batch-size", type=int, default=16)
+    common.add_argument("--prefetch", type=int, default=4, help="batches allowed in flight")
+    common.add_argument("--ack-timeout", type=float, default=300.0,
                         help="fail instead of hanging if the worker goes quiet this long")
-    feeder.add_argument("--seed", type=int, default=42)
-    feeder.add_argument("--data-dir", default="var")
+    common.add_argument("--seed", type=int, default=42)
+    common.add_argument("--data-dir", default="var")
+
+    subparsers.add_parser("feed", parents=[common],
+                          help="stream local crops to a remote CUDA host and train the actions")
+    detector = subparsers.add_parser("feed-detector", parents=[common],
+                                     help="stream local frames and train the surfer detector")
+    detector.set_defaults(batch_size=DETECTOR_BATCH_SIZE, epochs=DETECTOR_EPOCHS)
 
     subparsers.add_parser("serve", help="remote worker; started over ssh by feed")
 
     args = parser.parse_args(argv)
-    return _feed_cli(args) if args.command == "feed" else serve()
+    if args.command == "feed":
+        return _feed_cli(args)
+    if args.command == "feed-detector":
+        return _feed_detector_cli(args)
+    return serve()
 
 
 if __name__ == "__main__":

@@ -34,6 +34,13 @@ python3 -m venv .venv
 python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@192.168.x.x
 ```
 
+Detector 目前只有 CLI（UI 還沒接）。它吃的是「整張標完」的影格，pixels 會先降到 896×512
+存進 `var/cache/frames/`，模型寫到 `var/models/detector/`：
+
+```bash
+python -m surf_track.training.stream feed-detector --host user@192.168.x.x
+```
+
 ## Orin 部署契約
 
 ### 動作分類器（SGIE）
@@ -60,6 +67,11 @@ python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@1
    parser —— `nvdsinfer_yolo*_efficient_nms` 整個生態就是為此存在的。截掉後處理只要多寫
    FCOS 的 decode（anchor-free，約 25 行），沒有多付任何代價。
 3. **DDS 會強迫同步執行**，直接打在 pipeline 的 10 Hz 預算上。
+
+**PGIE 的縮放要設成 letterbox**：`maintain-aspect-ratio=1` 且 `symmetric-padding=0`。訓練時
+torchvision 的 `GeneralizedRCNNTransform` 是等比縮放後把 padding 補在右下（1920×1080 → 896×504
+再補 8 列），而 nvinfer 預設 `maintain-aspect-ratio=0` 會直接拉伸成 896×512。差異看起來很小，
+但那是一個訓練時完全沒出現過的幾何，而且不會有任何錯誤訊息。
 
 **不要規劃 `EfficientNMS_TRT`**：它在 TensorRT 10.12 被 deprecated，`EfficientNMS_ONNX_TRT`
 在 **10.16 被移除**，官方替代是 `INMSLayer`。
