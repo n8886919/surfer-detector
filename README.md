@@ -36,6 +36,8 @@ python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@1
 
 ## Orin 部署契約
 
+### 動作分類器（SGIE）
+
 寫在這裡是因為兩者都很容易在部署時踩到，而且事後很難察覺：
 
 - **SGIE 前必須用 pad probe 把偵測框擴成 `max(w, h) * 1.55` 的正方形**，不要用 nvinfer
@@ -45,6 +47,36 @@ python -m surf_track.training.stream feed --sharer 分享者名稱 --host user@1
 - **nvinfer 內建的 classifier parser 會對輸出取 argmax 且不套 sigmoid**，會把三個 logit
   折成一個互斥標籤，違背「三項獨立機率」。要用 `output-tensor-meta=1` 自己算 sigmoid。
 - ONNX 要 export dynamic batch（一次 batch 20–30 個 crop，而不是逐一呼叫）。
+
+### Detector（PGIE）：匯出必須截掉後處理
+
+torchvision 把分數過濾與 NMS 烘進 forward，匯出的圖會帶 `If` / `NonZero` / `TopK`，
+TensorRT 的靜態 engine 吃不下。**只匯出 `backbone` + `head`**，把 decode 與 NMS 留給
+DeepStream parser，圖就完全乾淨（八個候選實測皆如此）。訓練與本機評估仍用完整模型，
+Python 後處理沒有問題，所以要自己寫 decode 的地方只有 parser 一處。
+
+Faster R-CNN 系列不能用：`RoIAlign` 在網路中間而不是後處理，切不掉。
+
+640×640 單類、只含 backbone+head 的實測（`weights=None`，量的是圖與 MACs）：
+
+| 模型 | GMAC | 參數 | 匯出 |
+|---|---|---|---|
+| ssdlite320_mobilenet_v3_large | 1.6 | 2.2M | clean |
+| **mobilenet_v3_large_fpn + FCOS** | **6.6** | 9.2M | clean |
+| mobilenet_v3_large_fpn + RetinaNet | 6.7 | 9.3M | clean |
+| fcos_resnet50_fpn | 80.2 | 32.1M | clean |
+| retinanet_resnet50_fpn | 81.1 | 32.2M | clean |
+
+ResNet50-FPN 是**算力**出局而非匯出出局：80 GMAC 在 10 Hz 端到端預算下不可行。
+
+選 FCOS 而非 RetinaNet 的理由是 anchor-free —— RetinaNet 的 parser 必須把 anchor 尺寸、
+比例、每層 stride 一模一樣複製一遍，錯了不會報錯，只會讓 mAP 莫名偏低。
+
+輸入解析度定 640：框高中位數 200 px（原始），縮到 640 後 119 px，只有 34/1610 個框小於
+32 px；縮到 320 則有 284/1610（18%）過小。
+
+**上面沒有任何 ms 數字，因為還沒有在 Orin 上量過。** 要定案就在板子上跑
+`trtexec --fp16 --shapes=images:1x3x640x640`，不要拿別人的 benchmark 外推。
 
 ## 專案結構
 
