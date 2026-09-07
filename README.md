@@ -228,7 +228,7 @@ var/                    執行期資料（DB、影片、影格、模型、憑證
 
 未完成：私人 Drive OAuth、Facebook 登入與影片下載、bbox detector 訓練與 Orin 部署。
 
-規格見 [docs/spec.md](docs/spec.md)，開發約定見 [CLAUDE.md](CLAUDE.md)。
+規格見 [docs/spec.md](docs/spec.md)，Codex 專案指引見 [AGENTS.md](AGENTS.md)。
 
 ## 致謝
 
